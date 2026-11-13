@@ -40,9 +40,9 @@ user_states = {}  # {user_id: {...}}
 def default_data() -> dict:
     return {
         "counter": 1,
-        "subjects": {},   # Study Vault: {sid: {"name": str, "topics": {tid: {"name": str, "subtopics": {subid: {"name": str, "files": [...]}}}}}}
-        "mistakes": {},   # Mistake Bank: {"phy_0": [{"id": "m1", "title": str, "text": str, "msg_id": int|None, "type": "text"|"photo"}]}
-        "tests": {},      # HTML Live Tests: {testid: {"name": str, "questions": [{"q": str, "options": [...], "ans": int, "exp": str}]}}
+        "subjects": {},
+        "mistakes": {},
+        "tests": {},
     }
 
 
@@ -117,7 +117,6 @@ async def restore_from_pinned_backup(app: Application):
 
 # ================= FAST TEXT CHUNKER & AUTO-DELETE ENGINE =================
 def split_long_text(text: str, max_len: int = 3800) -> list[str]:
-    """लंबे टेक्स्ट/फॉर्मूला शीट को बिना HTML तोड़े सुरक्षित हिस्सों में बाँटता है ताकि टेलीग्राम पर तुरंत खुले।"""
     if len(text) <= max_len:
         return [text]
     chunks = []
@@ -195,7 +194,7 @@ def duration_prompt_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# ================= SMART HTML MCQ PARSER (FOR UPLOADED HTML TESTS) =================
+# ================= SMART HTML MCQ PARSER =================
 def strip_html_tags(raw: str) -> str:
     clean = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
     clean = re.sub(r"<[^>]+>", " ", clean)
@@ -204,14 +203,9 @@ def strip_html_tags(raw: str) -> str:
 
 
 def parse_html_mcq_file(html_bytes: bytes) -> list[dict]:
-    """
-    किसी भी HTML क्विज़/टेस्ट फाइल (JS Array, JSON या HTML divs/lists) से
-    सारे प्रश्न, 4 विकल्प (A,B,C,D), सही उत्तर और व्याख्या अपने आप निकाल लेता है।
-    """
     raw = html_bytes.decode("utf-8", errors="ignore")
     questions = []
 
-    # तरीका 1: JavaScript/JSON ऑब्जेक्ट पैटर्न (q/question, options/choices, ans/answer/correct)
     js_blocks = re.findall(
         r"\{[^{}]*?(?:q|question|title)\s*:\s*(['\"`])(.*?)\1[^{}]*?(?:options|choices)\s*:\s*\[(.*?)\][^{}]*?(?:ans|answer|correct|right)\s*:\s*(['\"`]?)(.*?)\4[^{}]*?\}",
         raw,
@@ -244,7 +238,6 @@ def parse_html_mcq_file(html_bytes: bytes) -> list[dict]:
     if questions:
         return questions
 
-    # तरीका 2: सामान्य HTML टेक्स्ट/लिस्ट पैटर्न (Q1. ... A) ... B) ... C) ... D) ... Ans: B)
     plain = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.S | re.I)
     plain = re.sub(r"<(br|p|div|li|h[1-6]|tr)[^>]*>", "\n", plain, flags=re.I)
     plain = html.unescape(re.sub(r"<[^>]+>", " ", plain))
@@ -297,7 +290,7 @@ def parse_html_mcq_file(html_bytes: bytes) -> list[dict]:
     return questions
 
 
-# ================= OFFLINE 1-TO-1 MCQ GENERATOR (ZERO API NEEDED) =================
+# ================= OFFLINE 1-TO-1 MCQ GENERATOR =================
 def build_formula_mcqs(formulas: list[tuple[str, str, str]]) -> list[dict]:
     if not formulas:
         return []
@@ -371,7 +364,8 @@ def build_lang_mcqs(item: dict, all_items: list[dict], is_hindi: bool) -> list[d
         make_q(f"Which works/honours belong to {item['author']}?", item["works"], "works", ["Gitanjali, The Home and the World", "Malgudi Days, The Guide", "Lyrical Ballads, The Prelude"])
 
     return mcqs
-        # ================= COMPLETE PHYSICS FORMULAS (ALL 14 CHAPTERS) =================
+
+# ================= COMPLETE PHYSICS FORMULAS (ALL 14 CHAPTERS) =================
 PHYSICS_DATA = {
     "title": "⚛️ Physics (भौतिकी)",
     "chapters": [
@@ -762,7 +756,7 @@ CHEMISTRY_DATA = {
                 ("द्रव्यमान प्रतिशत (% w/w)", "% w/w = (विलेय का द्रव्यमान / विलयन का द्रव्यमान) × 100", "ताप से अप्रभावित"),
                 ("आयतन प्रतिशत (% v/v)", "% v/v = (विलेय का आयतन / विलयन का आयतन) × 100", "ताप पर निर्भर"),
                 ("पार्ट्स प्रति मिलियन (ppm)", "ppm = (विलेय के भागों की संख्या / कुल भाग) × 10⁶", "अति तनु विलयनों की सांद्रता हेतु"),
-                                ("मोल अंश / मोल प्रभाज (Mole Fraction χ)", "χ_A = n_A / (n_A + n_B),  χ_A + χ_B = 1", "विमाहीन व ताप से स्वतंत्र"),
+                ("मोल अंश / मोल प्रभाज (Mole Fraction χ)", "χ_A = n_A / (n_A + n_B),  χ_A + χ_B = 1", "विमाहीन व ताप से स्वतंत्र"),
                 ("मोलरता (Molarity M)", "M = विलेय के मोल (n) / विलयन का आयतन (लीटर में)", "SI मात्रक: mol/L, ताप बढ़ाने पर घटती है"),
                 ("मोललता (Molality m)", "m = विलेय के मोल (n) / विलायक का द्रव्यमान (kg में)", "SI मात्रक: mol/kg, ताप से स्वतंत्र"),
                 ("नॉर्मलता (Normality N)", "N = विलेय के ग्राम तुल्यांक / विलयन का आयतन (L में)", "N = M × n-फैक्टर"),
@@ -776,7 +770,6 @@ CHEMISTRY_DATA = {
                 ("हिमांक अवनमन से विलेय का अणुभार (M_B)", "M_B = (1000 × K_f × w_B) / (ΔT_f × w_A)", "जल हेतु K_f = 1.86 K·kg/mol"),
                 ("परासरण दाब (Osmotic Pressure π - वांट हॉफ)", "π = C R T = (n_B / V) R T", "R = 0.0821 L·atm/(K·mol)"),
                 ("परासरण दाब से विलेय का अणुभार (M_B)", "M_B = (w_B × R × T) / (π × V)", "बृहदाणुओं (प्रोटीन/बहुलक) हेतु सर्वोत्तम विधि"),
-                ("मोल अंश / मोल प्रभाज (Mole Fraction χ)", "χ_A = n_A "),
                 ("वांट हॉफ गुणांक (van't Hoff Factor i)", "i = प्रेक्षित अणुसंख्य गुणधर्म / सैद्धांतिक गुणधर्म", "सैद्धांतिक अणुभार / प्रेक्षित अणुभार"),
                 ("वियोजन की मात्रा (Degree of Dissociation α)", "α = (i - 1) / (n - 1)", "n = प्रति अणु उत्पन्न कुल आयनों की संख्या"),
                 ("संगुणन की मात्रा (Degree of Association α)", "α = (1 - i) / (1 - 1/n)", "डाइमर (n=2) हेतु: α = 2(1 - i)"),
@@ -1018,73 +1011,7 @@ CHEMISTRY_DATA = {
         },
     ],
 }
-                ("कार्बोक्सिलिक अम्लों की अम्लीय प्रबलता नियम", "अम्लीय प्रबलता ∝ -I प्रभाव  तथा  ∝ 1 / (+I प्रभाव)", "CF₃COOH > CCl₃COOH > HCOOH > CH₃COOH"),
-            ],
-        },
-        {
-            "name": "13. ऐमीन",
-            "formulas": [
-                ("हॉफमान ब्रोमामाइड निम्नीकरण अभिक्रिया", "R-CONH₂ + Br₂ + 4NaOH → R-NH₂ + Na₂CO₃ + 2NaBr + 2H₂O", "एमाइड से एक कार्बन कम वाला 1° ऐमीन बनता है"),
-                ("गैब्रिएल थैलिमाइड संश्लेषण (Gabriel Synthesis)", "थैलिमाइड + KOH + R-X → NaOH(aq) → R-NH₂ (शुद्ध 1° ऐलिफैटिक ऐमीन)", "ऐरोमैटिक ऐमीन (ऐनिलीन) इससे नहीं बन सकता"),
-                ("कार्बिलऐमीन अभिक्रिया (आइसोसायनाइड परीक्षण)", "R-NH₂ + CHCl₃ + 3KOH (ऐल्को.) → R-NC (दुर्गंधयुक्त) + 3KCl + 3H₂O", "केवल प्राथमिक (1°) ऐमीन देते हैं (2° व 3° नहीं)"),
-                ("हिंसबर्ग अभिकर्मक (Hinsberg Reagent) परीक्षण", "अभिकर्मक: बेन्जीन सल्फोनिल क्लोराइड (C₆H₅SO₂Cl)", "1° उत्पाद KOH में विलेय | 2° अविलेय | 3° अभिक्रिया नहीं करता"),
-                ("ऐलिफैटिक ऐमीनों की क्षारीय प्रबलता (जलीय विलयन)", "मेथिल: (CH₃)₂NH > CH₃NH₂ > (CH₃)₃N > NH₃ (2° > 1° > 3°)", "एथिल: (C₂H₅)₂NH > (C₂H₅)₃N > C₂H₅NH₂ > NH₃ (2° > 3° > 1°)"),
-                ("गैसीय प्रावस्था में ऐमीनों की क्षारीयता क्रम", "3° ऐमीन > 2° ऐमीन > 1° ऐमीन > NH₃", "केवल +I प्रभाव पर निर्भर"),
-                ("डाइऐजोकरण अभिक्रिया (Diazotisation)", "C₆H₅NH₂ + NaNO₂ + 2HCl (273–278 K / 0–5°C) → C₆H₅N₂⁺Cl⁻ + NaCl + 2H₂O", "बेन्जीन डाइऐजोनियम क्लोराइड निर्माण"),
-                ("युग्मन अभिक्रिया (Coupling Reaction - ऐजो रंजक)", "C₆H₅N₂⁺Cl⁻ + फीनॉल (OH⁻) → p-हाइड्रॉक्सीऐजोबेन्जीन (नारंगी रंजक)", "ऐनिलीन के साथ पीला रंजक बनता है"),
-                ("ऐनिलीन का ब्रोमीनीकरण (Bromination)", "C₆H₅NH₂ + 3Br₂ (जल) → 2,4,6-ट्राइब्रोमोऐनिलीन (सफेद अवक्षेप)", "-NH₂ समूह अत्यधिक सक्रियणकारी है"),
-            ],
-        },
-        {
-            "name": "14. जैव-अणु",
-            "formulas": [
-                ("कार्बोहाइड्रेट का सामान्य सूत्र", "C_x(H₂O)_y", "ग्लूकोज व फ्रक्टोज दोनों का अणुसूत्र: C₆H₁₂O₆"),
-                ("ग्लूकोज व फ्रक्टोज में क्रियात्मक समूह अंतर", "ग्लूकोज: ऐल्डोहेक्सोज (-CHO समूह) | फ्रक्टोज: कीटोहेक्सोज (>C=O समूह)", "ग्लूकोज में 4 किरैल (असममित) कार्बन होते हैं"),
-                ("प्रमुख डाइसैकेराइड्स के जल-अपघटन उत्पाद", "सुक्रोज → ग्लूकोज + फ्रक्टोज | माल्टोज → 2 ग्लूकोज | लैक्टोज → ग्लूकोज + गैलैक्टोज", "सुक्रोज एक अनअपचायी शर्करा (Non-reducing) है"),
-                ("स्टार्च के दो मुख्य घटक", "ऐमिलोज (15-20%, जल में विलेय) + ऐमिलोपेक्टिन (80-85%, जल में अविलेय)", "दोनों α-D-ग्लूकोज के बहुलक हैं"),
-                ("पेप्टाइड बंध (Peptide Linkage)", "-CO-NH- बंध (दो α-ऐमीनो अम्लों के संघनन से निर्मित)", "प्रोटीन α-ऐमीनो अम्लों के बहुलक हैं"),
-                ("ज़्विटर आयन (Zwitter Ion)", "H₃N⁺-CHR-COO⁻ (उभयधर्मी द्विध्रुवीय आयन)", "समविभव बिंदु (Isoelectric Point) पर कुल आवेश शून्य"),
-                ("DNA व RNA के नाइट्रोजनी क्षारक", "DNA: A, G, C, T (थायमीन)  |  RNA: A, G, C, U (यूरैसिल)", "DNA में द्विकुंडली, RNA में एकल रज्जुक संरचना"),
-                ("चारगाफ का क्षार युग्मन नियम (Chargaff's Rule)", "A = T (2 हाइड्रोजन बंध)  तथा  G ≡ C (3 हाइड्रोजन बंध)", "(A + G) / (T + C) = 1"),
-                ("जल व वसा में विलेय विटामिन", "जल में विलेय: विटामिन B समूह व C | वसा में विलेय: विटामिन A, D, E, K", "विटामिन B₁₂ में कोबाल्ट (Co) धातु पाई जाती है"),
-                ("विटामिनों के रासायनिक नाम व कमी से रोग", "A (रेटिनॉल - रतौंधी) | B₁ (थायमीन - बेरी-बेरी) | C (एस्कॉर्बिक अम्ल - स्कर्वी) | D (कैल्सिफेरॉल - रिकेट्स)", "K (फिलोक्विनोन - रक्त का थक्का न जमना)"),
-            ],
-        },
-        {
-            "name": "15. बहुलक",
-            "formulas": [
-                ("पॉलिथीन (Polythene) का एकलक व प्रकार", "एकलक: एथीन (CH₂=CH₂)  →  -(CH₂-CH₂)ₙ-", "योगात्मक समबहुलक (Ziegler-Natta उत्प्रेरक से HDPE)"),
-                ("टेफ्लॉन (PTFE - नॉन-स्टिक बर्तन)", "एकलक: टेट्राफ्लोरोएथीन (CF₂=CF₂)  →  -(CF₂-CF₂)ₙ-", "ऊष्मा व रसायन प्रतिरोधी"),
-                ("PVC (पॉलिवाइनिल क्लोराइड)", "एकलक: वाइनिल क्लोराइड (CH₂=CHCl)  →  -(CH₂-CHCl)ₙ-", "पाइप व रेनकोट निर्माण में"),
-                ("ऑरलॉन / एक्रिलन (PAN)", "एकलक: एक्रिलोनाइट्राइल (CH₂=CH-CN)", "कृत्रिम ऊन (स्वेटर) निर्माण में"),
-                ("प्राकृतिक रबर (Natural Rubber)", "एकलक: आइसोप्रीन (2-मेथिल-1,3-ब्यूटाडाइन)", "सिस-1,4-पॉलिआइसोप्रीन; वल्कनीकरण में 3-5% सल्फर मिलाते हैं"),
-                ("निओप्रीन (संश्लेषित रबर)", "एकलक: क्लोरोप्रीन (2-क्लोरो-1,3-ब्यूटाडाइन)", "तेल व पेट्रोल प्रतिरोधी रबर"),
-                ("ब्यूना-S (Buna-S) सहबहुलक", "एकलक: 1,3-ब्यूटाडाइन + स्टाइरीन", "टायर व जूते के सोल निर्माण में"),
-                ("ब्यूना-N (Buna-N) सहबहुलक", "एकलक: 1,3-ब्यूटाडाइन + एक्रिलोनाइट्राइल", "तेल सील व टैंक अस्तर निर्माण में"),
-                ("नायलॉन-6,6 (Nylon-6,6 - पॉलिऐमाइड)", "एकलक: हेक्सामेथिलीनडाइऐमीन + ऐडिपिक अम्ल", "संघनन बहुलक (ऐमाइड बंध -CONH-)"),
-                ("नायलॉन-6 (Nylon-6)", "एकलक: कैप्रोलैक्टम (Caprolactam)", "रस्सियाँ व टायर कॉर्ड बनाने में"),
-                ("टेरिलीन / डेक्रॉन (Terylene - पॉलिएस्टर)", "एकलक: एथिलीन ग्लाइकॉल + टेरेफ्थैलिक अम्ल", "एस्टर बंध (-COO-) युक्त संघनन बहुलक"),
-                ("बैकेलाइट (Bakelite - तापद्रढ़ बहुलक)", "एकलक: फीनॉल + फॉर्मेल्डिहाइड (HCHO)", "विद्युत स्विच व कंघी निर्माण (तिर्यकबद्ध बहुलक)"),
-                ("जैव-निम्नीकरणीय बहुलक (Biodegradable)", "PHBV (3-हाइड्रॉक्सीब्यूटाइरेट + 3-हाइड्रॉक्सीवैलेरेट) तथा नायलॉन-2-नायलॉन-6", "पर्यावरण अनुकूल बहुलक"),
-            ],
-        },
-        {
-            "name": "16. दैनिक जीवन में रसायन",
-            "formulas": [
-                ("प्रशांतक (Tranquilizers - तनाव निवारक)", "इक्वैनिल, वेरोनल, ल्यूमिनल, क्लोरडाइएजेपॉक्साइड", "केंद्रीय तंत्रिका तंत्र पर कार्य करते हैं"),
-                ("पीड़ाहारी (Analgesics - दर्द निवारक)", "अस्वापक: ऐस्पिरिन, पैरासिटामोल | स्वापक (Narcotic): मॉर्फीन, हेरोइन, कोडीन", "ऐस्पिरिन = ऐसीटिल सैलिसिलिक अम्ल (ज्वरनाशी भी है)"),
-                ("प्रतिजैविक (Antibiotics)", "जीवाणुनाशी: पेनिसिलिन, ऑफ्लॉक्सासिन | जीवाणुनिरोधी: टेट्रासाइक्लिन, क्लोरैम्फेनिकॉल", "प्रथम प्रतिजैविक पेनिसिलिन (अलेक्जेंडर फ्लेमिंग)"),
-                ("पूतिरोधी (Antiseptics - जीवित ऊतकों पर)", "डेटॉल (क्लोरोजाइलिनॉल + टर्पिनिऑल), बिथियोनल (साबुन में), टिंक्चर आयोडीन (2-3% I₂)", "घाव साफ करने हेतु सुरक्षित"),
-                ("विसंक्रामी (Disinfectants - निर्जीव वस्तुओं पर)", "1% फीनॉल विलयन, क्लोरीन (0.2–0.4 ppm), SO₂", "0.2% फीनॉल पूतिरोधी, जबकि 1% फीनॉल विसंक्रामी है"),
-                ("प्रतिअम्ल (Antacids - एसिडिटी निवारक)", "रैनिटिडीन (ज़ैन्टैक), सिमेटिडीन, ओमेप्राजोल, Mg(OH)₂", "आमाशय में अत्यधिक HCl को उदासीन करते हैं"),
-                ("प्रतिहिस्टैमिन (Antihistamines - एलर्जी निवारक)", "ब्रोमफेनिरामिन (डिमेंटैप), टर्फेनाडिन (सेल्डेन)", "हिस्टैमिन के प्रभाव को रोकते हैं"),
-                ("कृत्रिम मधुरक (Artificial Sweeteners)", "सैकेरीन (550 गुना मीठा), ऐस्पार्टेम (100 गुना - केवल ठंडे खाद्य में), सुक्रालोज (600 गुना), ऐलिटेम (2000 गुना)", "मधुमेह रोगियों हेतु शून्य कैलोरी विकल्प"),
-                ("खाद्य परिरक्षक (Food Preservatives)", "सोडियम बेन्जोएट (C₆H₅COONa), साधारण नमक, शर्करा, वनस्पति तेल", "भोजन को सूक्ष्मजीवों से खराब होने से बचाते हैं"),
-                ("साबुन व संश्लेषित अपमार्जक में अंतर", "साबुन कठोर जल (Ca²⁺, Mg²⁺) में अवक्षेप बनाता है; अपमार्जक कठोर जल में भी झाग देता है", "धनायनिक अपमार्जक: सेटिलट्राइमेथिलअमोनियम ब्रोमाइड"),
-            ],
-        },
-    ],
-}
+
 # ================= COMPLETE MATHEMATICS FORMULAS (ALL 13 CHAPTERS) =================
 MATH_DATA = {
     "title": "📐 Mathematics (गणित)",
@@ -1274,7 +1201,6 @@ MATH_DATA = {
             "name": "13. प्रायिकता",
             "formulas": [
                 ("सप्रतिबंध प्रायिकता (Conditional Probability)", "P(E | F) = P(E ∩ F) / P(F)  (जहाँ P(F) ≠ 0)", "घटना F घटित होने पर E की प्रायिकता"),
-                             ("सप्रतिबंध प्रायिकता (Conditional Probability)", "P(E | F) = P(E ∩ F) / P(F)  (जहाँ P(F) ≠ 0)", "घटना F घटित होने पर E की प्रायिकता"),
                 ("प्रायिकता का गुणन नियम (Multiplication Theorem)", "P(E ∩ F) = P(E) · P(F | E) = P(F) · P(E | F)", "संयुक्त घटना की प्रायिकता"),
                 ("स्वतंत्र घटनाओं (Independent Events) की शर्त", "P(E ∩ F) = P(E) · P(F)", "यदि E व F स्वतंत्र हैं तो E' व F' भी स्वतंत्र होंगी"),
                 ("संपूर्ण प्रायिकता प्रमेय (Total Probability Theorem)", "P(A) = Σ P(E_i) · P(A | E_i)", "E₁, E₂... प्रतिदर्श समष्टि का विभाजन हैं"),
@@ -1540,6 +1466,7 @@ BIOLOGY_DATA = {
         },
     ],
 }
+
 # ================= VERIFIED HINDI & ENGLISH SYLLABUS DATA =================
 HINDI_DATA = {
     "gadya": [
@@ -2140,7 +2067,7 @@ def get_chapter_list_for_subject(subj_code: str) -> tuple[str, list[str]]:
     return "Subject", []
 
 
-# ================= GEMINI API HELPER (ONLY FOR AI DOUBT SOLVER) =================
+# ================= GEMINI API HELPER =================
 async def call_gemini_doubt(prompt: str, image_bytes: bytes | None = None) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     parts = [{"text": prompt}]
@@ -2337,7 +2264,7 @@ def is_authorized(user_id: int) -> bool:
 async def cmd_suraj(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != OWNER_ID:
-        return  # बाहरी यूज़र के लिए पूरी तरह Silent
+        return
 
     if is_authorized(user_id):
         rem_hrs = round((login_expiry_ts - time.time()) / 3600, 1)
@@ -2363,7 +2290,7 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔒 लॉगआउट हो गया। दोबारा खोलने के लिए /suraj भेजें।")
 
 
-# ================= INTERACTIVE MCQ QUIZ ENGINE (WITH LIVE TIMER & MISTAKE REPORT) =================
+# ================= INTERACTIVE MCQ QUIZ ENGINE =================
 async def send_quiz_question(target_msg, user_id: int, context: ContextTypes.DEFAULT_TYPE, edit=False):
     st = user_states.get(user_id, {})
     quiz = st.get("quiz", {})
@@ -2450,11 +2377,10 @@ async def send_quiz_question(target_msg, user_id: int, context: ContextTypes.DEF
         await target_msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-# ================= TIMED ACTION EXECUTOR (100% FAST TEXT — NO PHOTO GENERATION) =================
+# ================= TIMED ACTION EXECUTOR =================
 async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: int, dur_label: str, context: ContextTypes.DEFAULT_TYPE, from_button=False):
     action = pending.get("action")
 
-    # 1. AI Doubt Hint (Fast Text)
     if action == "DOUBT_HINT":
         wait = await msg_obj.edit_text("💡 हिंट तैयार हो रहा है...") if from_button else await msg_obj.reply_text("💡 हिंट तैयार हो रहा है...")
         prompt = (
@@ -2473,7 +2399,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         except Exception as e:
             await wait.edit_text(f"⚠️ त्रुटि: {e}")
 
-    # 2. AI Doubt Solution (Fast Text — No Image Delay)
     elif action == "DOUBT_SOL":
         wait = (
             await msg_obj.edit_text("📝 स्टेप-बाय-स्टेप सॉल्यूशन तैयार हो रहा है...")
@@ -2511,7 +2436,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         except Exception as e:
             await wait.edit_text(f"⚠️ सॉल्यूशन त्रुटि: {e}")
 
-    # 3. Revision Bank: Complete Formulas in Fast Text (100% Offline)
     elif action == "REV_FORMULA_SHEET":
         subj, idx = pending["subj"], pending["idx"]
         sdata = REVISION_SUBJECTS[subj]
@@ -2551,7 +2475,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
             sent_ids.append(m.message_id)
         schedule_custom_delete(context, user_id, sent_ids, dur_sec)
 
-    # 4. Revision Bank: Biology Chapter Diagrams Labeling in Fast Text (100% Offline)
     elif action == "REV_BIO_DIAGRAMS":
         idx = pending["idx"]
         ch_obj = BIOLOGY_DATA["chapters"][idx]
@@ -2572,7 +2495,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         )
         schedule_custom_delete(context, user_id, [sent.message_id], dur_sec)
 
-    # 5. Revision Bank: Offline 1-to-1 Formula MCQs
     elif action == "REV_OFFLINE_MCQ":
         subj, idx = pending["subj"], pending["idx"]
         ch_obj = REVISION_SUBJECTS[subj]["chapters"][idx]
@@ -2591,7 +2513,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         }
         await send_quiz_question(msg_obj, user_id, context, edit=from_button)
 
-    # 6. Revision Bank: Hindi / English Verified Author Notes
     elif action == "REV_LANG_NOTES":
         lang, sec, idx = pending["lang"], pending["sec"], pending["idx"]
         if lang == "hin":
@@ -2635,7 +2556,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         sent = await msg_obj.edit_text(card, parse_mode="HTML", reply_markup=kb) if from_button else await msg_obj.reply_text(card, parse_mode="HTML", reply_markup=kb)
         schedule_custom_delete(context, user_id, [sent.message_id], dur_sec)
 
-    # 7. Revision Bank: Hindi / English All Possible Offline MCQs
     elif action == "REV_LANG_MCQ":
         lang, sec, idx = pending["lang"], pending["sec"], pending["idx"]
         all_list = HINDI_DATA[sec] if lang == "hin" else ENGLISH_DATA[sec]
@@ -2655,7 +2575,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         }
         await send_quiz_question(msg_obj, user_id, context, edit=from_button)
 
-    # 8. Mistake Bank: View Saved Chapter Mistakes
     elif action == "VIEW_MISTAKES":
         subj, idx = pending["subj"], pending["idx"]
         _, ch_list = get_chapter_list_for_subject(subj)
@@ -2712,7 +2631,6 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         sent_ids.append(nav.message_id)
         schedule_custom_delete(context, user_id, sent_ids, dur_sec)
 
-    # 9. Feature 5: Start Uploaded HTML Live MCQ Test
     elif action == "RUN_HTML_TEST":
         tid = pending["tid"]
         tinfo = vault_data.get("tests", {}).get(tid)
@@ -2752,7 +2670,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if user_id != OWNER_ID:
-        return  # बाहरी यूज़र के लिए पूरी तरह Silent
+        return
 
     await query.answer()
 
@@ -2764,7 +2682,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb = query.data
     parts = cb.split(":")
 
-    # ---------- MODE SWITCHING ----------
     if cb == "root_home":
         user_states.pop(user_id, None)
         await query.edit_message_text("🏠 <b>Sanskari Study</b>\nअपना मोड चुनें:", parse_mode="HTML", reply_markup=root_mode_kb())
@@ -2777,7 +2694,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = {"mode": "ADMIN"}
         await query.edit_message_text("🛠️ <b>Admin / Manage Mode</b>\nयहाँ से आप सब कुछ Add, Edit और Delete कर सकते हैं:", parse_mode="HTML", reply_markup=admin_home_kb())
 
-    # ---------- DURATION PICKER ----------
     elif parts[0] == "dur_pick":
         dur_sec = int(parts[1])
         dur_label = parts[2]
@@ -2789,7 +2705,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states.pop(user_id, None)
         await execute_timed_action(query.message, user_id, pending, dur_sec, dur_label, context, from_button=True)
 
-    # ---------- FEATURE 1: MY STUDY VAULT ----------
     elif cb in ("s_vault", "adm_vault"):
         is_adm = cb == "adm_vault"
         user_states[user_id] = {"mode": "ADMIN" if is_adm else "STUDY"}
@@ -2903,7 +2818,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ अपलोड पूरा हुआ", callback_data=f"v_st:{sid}:{tid}:{subid}")]]),
         )
 
-    # ---------- FEATURE 2: AI DOUBT SOLVER ----------
     elif cb == "s_doubt":
         user_states[user_id] = {"mode": "STUDY", "step": "DOUBT_WAIT_Q"}
         await query.edit_message_text(
@@ -2921,7 +2835,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await prompt_for_duration(query.message, user_id, pending, edit=True)
 
-    # ---------- FEATURE 3: BIHAR BOARD REVISION BANK ----------
     elif cb == "s_rev":
         user_states[user_id] = {"mode": "STUDY"}
         await query.edit_message_text("📚 <b>Bihar Board Revision Bank</b>\nअपना विषय चुनें:", parse_mode="HTML", reply_markup=revision_subjects_kb())
@@ -3003,7 +2916,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif parts[0] in ("r_lm_ask", "r_lang_mcq_direct"):
         await prompt_for_duration(query.message, user_id, {"action": "REV_LANG_MCQ", "lang": parts[1], "sec": parts[2], "idx": int(parts[3])}, edit=True)
 
-    # Interactive MCQ Answer Checking (Records Wrong Answers + Live Timer)
     elif parts[0] == "qz_ans":
         chosen = int(parts[1])
         st = user_states.get(user_id, {})
@@ -3053,7 +2965,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st["quiz"]["idx"] = len(st["quiz"]["questions"])
             await send_quiz_question(query.message, user_id, context, edit=True)
 
-    # ---------- FEATURE 4: MISTAKE BANK ----------
     elif cb in ("s_mis", "adm_mis"):
         is_adm = cb == "adm_mis"
         user_states[user_id] = {"mode": "ADMIN" if is_adm else "STUDY"}
@@ -3104,7 +3015,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text(f"<b>{html.escape(mitem['title'])}</b>\n\n{html.escape(mitem.get('text', ''))}", parse_mode="HTML")
 
-    # ---------- FEATURE 5: HTML LIVE MCQ TESTS ----------
     elif cb in ("s_html_test", "adm_html_test"):
         is_adm = cb == "adm_html_test"
         user_states[user_id] = {"mode": "ADMIN" if is_adm else "STUDY"}
@@ -3142,7 +3052,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global login_expiry_ts
     user_id = update.effective_user.id
     if user_id != OWNER_ID:
-        return  # बाहरी यूज़र के लिए पूरी तरह Silent
+        return
 
     text = update.message.text.strip()
     st = user_states.get(user_id, {})
@@ -3280,13 +3190,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_authorized(user_id):
-        return  # बाहरी यूज़र के लिए पूरी तरह Silent
+        return
 
     msg = update.message
     st = user_states.get(user_id, {})
     step = st.get("step")
 
-    # Feature 5: HTML Test File Upload
     if step == "HT_WAIT_FILE" and msg.document:
         fname = msg.document.file_name or "Live_Test.html"
         if not fname.lower().endswith((".html", ".htm")):
