@@ -3476,3 +3476,31 @@ def main():
 
 if __name__ == "__main__":
     main()
+def main():
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    ensure_fonts()
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    app = Application.builder().token(BOT_TOKEN).post_init(restore_from_pinned_backup).build()
+
+    app.add_handler(CommandHandler("suraj", cmd_suraj))
+    app.add_handler(CommandHandler("logout", cmd_logout))
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL | filters.VIDEO | filters.PHOTO | filters.AUDIO | filters.VOICE,
+            handle_media,
+        )
+    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    print("Sanskari Study Bot (100% Offline Revision + 4-in-1 Vault) running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
