@@ -1,17 +1,16 @@
 import os
 import re
 import io
-import math
+import time
 import json
 import html
 import random
 import base64
+import asyncio
 import threading
 import http.server
 import socketserver
-import urllib.request
 import httpx
-from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -25,14 +24,15 @@ from telegram.ext import (
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "-1001234567890"))
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "-1004369449565"))
 OWNER_ID = int(os.getenv("OWNER_ID", "8283878643"))
-BOT_PASSWORD = os.getenv("BOT_PASSWORD", "Suraj@123")
-VAULT_AUTO_DELETE_SECONDS = 7200  # My Study Vault के लिए फिक्स 2 घंटे (7200 सेकंड)
+BOT_PASSWORD = os.getenv("BOT_PASSWORD", "Boss@2011123")
+VAULT_AUTO_DELETE_SECONDS = 7200   # My Study Vault के लिए फिक्स 2 घंटे
+LOGIN_VALIDITY_SECONDS = 86400     # 24 घंटे में सिर्फ़ 1 बार लॉगिन
 DATA_FILE = "sanskari_study_data.json"
 # =================================================
 
-is_logged_in = False
+login_expiry_ts = 0.0
 user_states = {}  # {user_id: {...}}
 
 
@@ -42,6 +42,7 @@ def default_data() -> dict:
         "counter": 1,
         "subjects": {},   # Study Vault: {sid: {"name": str, "topics": {tid: {"name": str, "subtopics": {subid: {"name": str, "files": [...]}}}}}}
         "mistakes": {},   # Mistake Bank: {"phy_0": [{"id": "m1", "title": str, "text": str, "msg_id": int|None, "type": "text"|"photo"}]}
+        "tests": {},      # HTML Live Tests: {testid: {"name": str, "questions": [{"q": str, "options": [...], "ans": int, "exp": str}]}}
     }
 
 
@@ -53,6 +54,7 @@ def load_local_data() -> dict:
                 d.setdefault("counter", 1)
                 d.setdefault("subjects", {})
                 d.setdefault("mistakes", {})
+                d.setdefault("tests", {})
                 return d
         except Exception:
             pass
@@ -108,12 +110,29 @@ async def restore_from_pinned_backup(app: Application):
                 tg_file = await doc.get_file()
                 await tg_file.download_to_drive(DATA_FILE)
                 vault_data = load_local_data()
-                print("✅ Sanskari Study backup restored from pinned channel message!")
+                print("✅ Sanskari Study backup restored!")
     except Exception as e:
         print("Backup restore skipped:", e)
 
 
-# ================= CUSTOM DURATION & AUTO-DELETE ENGINE =================
+# ================= FAST TEXT CHUNKER & AUTO-DELETE ENGINE =================
+def split_long_text(text: str, max_len: int = 3800) -> list[str]:
+    """लंबे टेक्स्ट/फॉर्मूला शीट को बिना HTML तोड़े सुरक्षित हिस्सों में बाँटता है ताकि टेलीग्राम पर तुरंत खुले।"""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > max_len and current:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def parse_duration_seconds(raw_text: str) -> tuple[int, str]:
     txt = raw_text.strip().lower()
     m = re.search(r"(\d+(?:\.\d+)?)", txt)
@@ -133,6 +152,17 @@ def parse_duration_seconds(raw_text: str) -> tuple[int, str]:
     return secs, label
 
 
+def format_elapsed_time(seconds: float) -> str:
+    sec = max(1, int(seconds))
+    mins, rem_s = divmod(sec, 60)
+    hrs, rem_m = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs} घंटा {rem_m} मिनट {rem_s} सेकंड"
+    if mins > 0:
+        return f"{mins} मिनट {rem_s} सेकंड"
+    return f"{rem_s} सेकंड"
+
+
 async def auto_delete_job(context: ContextTypes.DEFAULT_TYPE):
     jd = context.job.data
     for mid in jd.get("message_ids", []):
@@ -143,7 +173,7 @@ async def auto_delete_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def schedule_custom_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_ids: list[int], seconds: int):
-    if message_ids:
+    if message_ids and context.job_queue:
         context.job_queue.run_once(
             auto_delete_job,
             when=seconds,
@@ -165,378 +195,110 @@ def duration_prompt_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# ================= FONT & SINGLE-PAGE NOTEBOOK ENGINE =================
-FONT_DIR = "fonts"
-FONT_REG_PATH = os.path.join(FONT_DIR, "NotoSansDevanagari-Regular.ttf")
-FONT_BOLD_PATH = os.path.join(FONT_DIR, "NotoSansDevanagari-Bold.ttf")
+# ================= SMART HTML MCQ PARSER (FOR UPLOADED HTML TESTS) =================
+def strip_html_tags(raw: str) -> str:
+    clean = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+    clean = re.sub(r"<[^>]+>", " ", clean)
+    clean = html.unescape(clean)
+    return re.sub(r"\s+", " ", clean).strip()
 
 
-def ensure_fonts():
-    os.makedirs(FONT_DIR, exist_ok=True)
-    urls = {
-        FONT_REG_PATH: "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf",
-        FONT_BOLD_PATH: "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Bold.ttf",
-    }
-    for path, url in urls.items():
-        if not os.path.exists(path):
-            try:
-                urllib.request.urlretrieve(url, path)
-            except Exception:
-                pass
+def parse_html_mcq_file(html_bytes: bytes) -> list[dict]:
+    """
+    किसी भी HTML क्विज़/टेस्ट फाइल (JS Array, JSON या HTML divs/lists) से
+    सारे प्रश्न, 4 विकल्प (A,B,C,D), सही उत्तर और व्याख्या अपने आप निकाल लेता है।
+    """
+    raw = html_bytes.decode("utf-8", errors="ignore")
+    questions = []
 
-
-def get_fonts(scale: float = 1.0):
-    ensure_fonts()
-    try:
-        return (
-            ImageFont.truetype(FONT_BOLD_PATH, max(20, int(34 * scale))),
-            ImageFont.truetype(FONT_REG_PATH, max(16, int(23 * scale))),
-            ImageFont.truetype(FONT_BOLD_PATH, max(18, int(26 * scale))),
-            ImageFont.truetype(FONT_REG_PATH, max(17, int(25 * scale))),
-        )
-    except Exception:
-        fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        if os.path.exists(fallback):
-            return (
-                ImageFont.truetype(fallback, max(20, int(32 * scale))),
-                ImageFont.truetype(fallback, max(16, int(21 * scale))),
-                ImageFont.truetype(fallback, max(18, int(24 * scale))),
-                ImageFont.truetype(fallback, max(17, int(23 * scale))),
-            )
-        d = ImageFont.load_default()
-        return d, d, d, d
-
-
-def clean_math_text(raw: str) -> str:
-    txt = raw.replace("**", "").replace("###", "").replace("##", "").replace("$", "")
-    replacements = {
-        "\\times": "×", "\\div": "÷", "\\pm": "±", "\\pi": "π", "\\theta": "θ",
-        "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\Delta": "Δ", "\\lambda": "λ",
-        "\\mu": "μ", "\\epsilon_0": "ε₀", "\\sigma": "σ", "\\omega": "ω", "\\Omega": "Ω",
-        "\\int": "∫", "\\sqrt": "√", "\\infty": "∞", "\\rightarrow": "→", "\\Rightarrow": "⇒",
-        "\\approx": "≈", "\\leq": "≤", "\\geq": "≥", "\\neq": "≠",
-    }
-    for k, v in replacements.items():
-        txt = txt.replace(k, v)
-    return txt
-
-
-def wrap_text_lines(body_text: str, f_bold, f_body, max_w: int) -> list[tuple[str, bool]]:
-    cleaned = clean_math_text(body_text)
-    wrapped = []
-    for rline in cleaned.splitlines():
-        stripped = rline.strip()
-        if not stripped:
-            wrapped.append(("", False))
+    # तरीका 1: JavaScript/JSON ऑब्जेक्ट पैटर्न (q/question, options/choices, ans/answer/correct)
+    js_blocks = re.findall(
+        r"\{[^{}]*?(?:q|question|title)\s*:\s*(['\"`])(.*?)\1[^{}]*?(?:options|choices)\s*:\s*\[(.*?)\][^{}]*?(?:ans|answer|correct|right)\s*:\s*(['\"`]?)(.*?)\4[^{}]*?\}",
+        raw,
+        flags=re.S | re.I,
+    )
+    for _, q_raw, opts_raw, _, ans_raw in js_blocks:
+        q_txt = strip_html_tags(q_raw)
+        opt_items = re.findall(r"(['\"`])(.*?)\1", opts_raw, flags=re.S)
+        opts = [strip_html_tags(o[1]) for o in opt_items if strip_html_tags(o[1])]
+        if not q_txt or len(opts) < 2:
             continue
-        is_head = (
-            stripped.endswith(":")
-            or any(
-                stripped.startswith(p)
-                for p in ["दिया गया है", "चूँकि", "नियमानुसार", "सूत्र", "हल", "अतः", "◆", "■"]
-            )
-            or bool(re.match(r"^\d+\.\s", stripped))
-        )
-        font_use = f_bold if is_head else f_body
-        words = stripped.split(" ")
-        current = ""
-        for w in words:
-            test = f"{current} {w}".strip()
-            if font_use.getlength(test) <= max_w:
-                current = test
+        while len(opts) < 4:
+            opts.append("उपरोक्त में से कोई नहीं")
+        opts = opts[:4]
+
+        ans_clean = strip_html_tags(ans_raw).strip()
+        ans_idx = 0
+        if ans_clean.isdigit():
+            val = int(ans_clean)
+            ans_idx = val if 0 <= val <= 3 else (val - 1 if 1 <= val <= 4 else 0)
+        elif ans_clean.upper() in ("A", "B", "C", "D"):
+            ans_idx = ["A", "B", "C", "D"].index(ans_clean.upper())
+        else:
+            for idx_o, o_txt in enumerate(opts):
+                if ans_clean.lower() == o_txt.lower() or ans_clean.lower() in o_txt.lower():
+                    ans_idx = idx_o
+                    break
+        questions.append({"q": q_txt, "options": opts, "ans": ans_idx, "exp": ""})
+
+    if questions:
+        return questions
+
+    # तरीका 2: सामान्य HTML टेक्स्ट/लिस्ट पैटर्न (Q1. ... A) ... B) ... C) ... D) ... Ans: B)
+    plain = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.S | re.I)
+    plain = re.sub(r"<(br|p|div|li|h[1-6]|tr)[^>]*>", "\n", plain, flags=re.I)
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", plain))
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in plain.splitlines() if ln.strip()]
+
+    cur_q, cur_opts, cur_ans, cur_exp = "", [], None, ""
+    for ln in lines:
+        q_m = re.match(r"^(?:Q(?:uestion)?\s*\d*[\.\):\-]\s*|\d+[\.\)]\s+)(.+)", ln, flags=re.I)
+        opt_m = re.match(r"^\(?([A-Da-d1-4])[\.\)\-:]\s*(.+)", ln)
+        ans_m = re.match(r"^(?:Ans(?:wer)?|Correct(?:\s*Answer)?|उत्तर|सही\s*उत्तर)\s*[:\-]\s*(.+)", ln, flags=re.I)
+        exp_m = re.match(r"^(?:Exp(?:lanation)?|Solution|व्याख्या|हल)\s*[:\-]\s*(.+)", ln, flags=re.I)
+
+        if ans_m:
+            val = ans_m.group(1).strip()
+            letter_m = re.match(r"^\(?([A-Da-d])[\.\)\s]?", val)
+            if letter_m:
+                cur_ans = ["A", "B", "C", "D"].index(letter_m.group(1).upper())
             else:
-                if current:
-                    wrapped.append((current, is_head))
-                while font_use.getlength(w) > max_w and len(w) > 1:
-                    cut = len(w) - 1
-                    while cut > 1 and font_use.getlength(w[:cut]) > max_w:
-                        cut -= 1
-                    wrapped.append((w[:cut], is_head))
-                    w = w[cut:]
-                current = w
-        if current:
-            wrapped.append((current, is_head))
-    return wrapped
+                for idx_o, o_txt in enumerate(cur_opts):
+                    if val.lower() in o_txt.lower():
+                        cur_ans = idx_o
+                        break
+        elif exp_m:
+            cur_exp = exp_m.group(1).strip()
+        elif opt_m and cur_q and len(cur_opts) < 4:
+            cur_opts.append(opt_m.group(2).strip())
+        elif q_m:
+            if cur_q and len(cur_opts) >= 2:
+                while len(cur_opts) < 4:
+                    cur_opts.append("इनमें से कोई नहीं")
+                questions.append({
+                    "q": cur_q,
+                    "options": cur_opts[:4],
+                    "ans": cur_ans if cur_ans is not None else 0,
+                    "exp": cur_exp,
+                })
+            cur_q = q_m.group(1).strip()
+            cur_opts, cur_ans, cur_exp = [], None, ""
 
+    if cur_q and len(cur_opts) >= 2:
+        while len(cur_opts) < 4:
+            cur_opts.append("इनमें से कोई नहीं")
+        questions.append({
+            "q": cur_q,
+            "options": cur_opts[:4],
+            "ans": cur_ans if cur_ans is not None else 0,
+            "exp": cur_exp,
+        })
 
-def render_single_page_sheet(header_title: str, subtitle: str, body_text: str) -> io.BytesIO:
-    """पूरे चैप्टर के सभी फॉर्मूलों को एक ही सिंगल HD कॉपी-पेज पर फिट करके बनाता है।"""
-    W = 1280
-    MARGIN_LEFT = 125
-    MARGIN_RIGHT = 55
-    MAX_TEXT_W = W - MARGIN_LEFT - MARGIN_RIGHT
-
-    # पहले सामान्य स्केल पर लाइनें गिनें; यदि बहुत अधिक फॉर्मूले हों तो हल्का स्केल समायोजित करें ताकि Telegram photo limit (W+H <= 9800) में रहे
-    scale = 1.0
-    f_title, f_sub, f_bold, f_body = get_fonts(scale)
-    wrapped_lines = wrap_text_lines(body_text, f_bold, f_body, MAX_TEXT_W)
-    line_h = 44
-    top_h = 160
-    est_h = top_h + len(wrapped_lines) * line_h + 90
-
-    if est_h > 8200:
-        scale = max(0.72, 8200 / est_h)
-        f_title, f_sub, f_bold, f_body = get_fonts(scale)
-        wrapped_lines = wrap_text_lines(body_text, f_bold, f_body, MAX_TEXT_W)
-        line_h = max(32, int(44 * scale))
-        top_h = max(125, int(160 * scale))
-
-    H = max(1400, top_h + len(wrapped_lines) * line_h + 95)
-
-    img = Image.new("RGB", (W, H), "#FFFDF7")
-    draw = ImageDraw.Draw(img)
-
-    # टॉप हेडर बॉक्स व लाल बॉर्डर
-    draw.rectangle([0, 0, W, top_h], fill="#EEF2F7")
-    draw.line([(0, top_h), (W, top_h)], fill="#C53030", width=3)
-
-    # बाईं लाल डबल मार्जिन लाइन
-    draw.line([(105, 0), (105, H)], fill="#E53E3E", width=2)
-    draw.line([(112, 0), (112, H)], fill="#E53E3E", width=2)
-
-    # रूलदार नीली लाइनें
-    y_line = top_h + line_h
-    while y_line < H - 55:
-        draw.line([(0, y_line), (W, y_line)], fill="#CBD5E0", width=1)
-        y_line += line_h
-
-    draw.text((MARGIN_LEFT, 26), header_title[:58], font=f_title, fill="#1A365D")
-    draw.text((MARGIN_LEFT, int(top_h * 0.52)), subtitle[:80], font=f_sub, fill="#4A5568")
-
-    badge = "1-Page Complete Sheet"
-    bw = f_sub.getlength(badge)
-    draw.text((W - MARGIN_RIGHT - bw, 32), badge, font=f_sub, fill="#C53030")
-
-    cur_y = top_h + 8
-    for line_txt, is_head in wrapped_lines:
-        if line_txt:
-            fnt = f_bold if is_head else f_body
-            clr = "#1A202C" if is_head else "#1E293B"
-            draw.text((MARGIN_LEFT, cur_y), line_txt, font=fnt, fill=clr)
-        cur_y += line_h
-
-    draw.text((MARGIN_LEFT, H - 48), "Sanskari Study • Bihar Board Class 12th Complete Formula Sheet", font=f_sub, fill="#718096")
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    buf.seek(0)
-    return buf
-
-
-def render_notebook_pages(header_title: str, subtitle: str, body_text: str) -> list[io.BytesIO]:
-    """AI Doubt Solver के लिए A4 पेज विभाजन वाला नोटबुक रेंडरर।"""
-    f_title, f_sub, f_bold, f_body = get_fonts(1.0)
-    W, H = 1240, 1754
-    MARGIN_LEFT = 125
-    MARGIN_RIGHT = 60
-    TOP_HEADER_H = 165
-    LINE_HEIGHT = 46
-    BOTTOM_LIMIT = H - 80
-    MAX_TEXT_W = W - MARGIN_LEFT - MARGIN_RIGHT
-
-    wrapped_lines = wrap_text_lines(body_text, f_bold, f_body, MAX_TEXT_W)
-    lines_per_page = (BOTTOM_LIMIT - (TOP_HEADER_H + 20)) // LINE_HEIGHT
-    total_pages = max(1, (len(wrapped_lines) + lines_per_page - 1) // lines_per_page)
-    pages_io = []
-
-    for p_idx in range(total_pages):
-        img = Image.new("RGB", (W, H), "#FFFDF7")
-        draw = ImageDraw.Draw(img)
-
-        draw.rectangle([0, 0, W, TOP_HEADER_H], fill="#F3F6FA")
-        draw.line([(0, TOP_HEADER_H), (W, TOP_HEADER_H)], fill="#C53030", width=3)
-        draw.line([(105, 0), (105, H)], fill="#E53E3E", width=2)
-        draw.line([(112, 0), (112, H)], fill="#E53E3E", width=2)
-
-        y_line = TOP_HEADER_H + LINE_HEIGHT
-        while y_line < BOTTOM_LIMIT + 20:
-            draw.line([(0, y_line), (W, y_line)], fill="#CBD5E0", width=1)
-            y_line += LINE_HEIGHT
-
-        draw.text((MARGIN_LEFT, 28), header_title[:55], font=f_title, fill="#1A365D")
-        draw.text((MARGIN_LEFT, 82), subtitle[:75], font=f_sub, fill="#4A5568")
-        page_badge = f"Page {p_idx + 1} / {total_pages}"
-        badge_w = f_sub.getlength(page_badge)
-        draw.text((W - MARGIN_RIGHT - badge_w, 34), page_badge, font=f_sub, fill="#C53030")
-
-        chunk = wrapped_lines[p_idx * lines_per_page : (p_idx + 1) * lines_per_page]
-        cur_y = TOP_HEADER_H + 10
-        for line_txt, is_head in chunk:
-            if line_txt:
-                fnt = f_bold if is_head else f_body
-                clr = "#1A202C" if is_head else "#1E293B"
-                draw.text((MARGIN_LEFT, cur_y), line_txt, font=fnt, fill=clr)
-            cur_y += LINE_HEIGHT
-
-        draw.text((MARGIN_LEFT, H - 52), "Sanskari Study • Bihar Board Class 12th", font=f_sub, fill="#718096")
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        pages_io.append(buf)
-
-    return pages_io
-
-
-# ================= BIOLOGY SINGLE-PAGE DIAGRAM ENGINE =================
-def draw_bio_shape(draw: ImageDraw.Draw, shape_type: str, box: tuple[int, int, int, int], f_lbl):
-    x1, y1, x2, y2 = box
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    w, h = x2 - x1, y2 - y1
-
-    if shape_type == "binary_fission":
-        draw.ellipse([x1 + 30, cy - 35, x1 + 120, cy + 35], outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.ellipse([x1 + 62, cy - 12, x1 + 88, cy + 12], fill="#C53030")
-        draw.text((x1 + 35, cy + 42), "जनक अमीबा", font=f_lbl, fill="#1A202C")
-        draw.line([(x1 + 135, cy), (x1 + 185, cy)], fill="#2D3748", width=3)
-        draw.ellipse([x1 + 200, cy - 30, x1 + 330, cy + 30], outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.ellipse([x1 + 230, cy - 10, x1 + 252, cy + 10], fill="#C53030")
-        draw.ellipse([x1 + 278, cy - 10, x1 + 300, cy + 10], fill="#C53030")
-        draw.text((x1 + 205, cy + 42), "केंद्रक विभाजन", font=f_lbl, fill="#1A202C")
-        draw.line([(x1 + 345, cy), (x1 + 395, cy)], fill="#2D3748", width=3)
-        draw.ellipse([x1 + 410, cy - 55, x1 + 485, cy - 5], outline="#2F855A", width=3, fill="#F0FFF4")
-        draw.ellipse([x1 + 410, cy + 5, x1 + 485, cy + 55], outline="#2F855A", width=3, fill="#F0FFF4")
-        draw.text((x1 + 400, cy + 62), "दो पुत्री अमीबा", font=f_lbl, fill="#22543D")
-
-    elif shape_type == "budding":
-        draw.ellipse([x1 + 60, cy - 55, x1 + 180, cy + 55], outline="#B7791F", width=3, fill="#FEFCBF")
-        draw.ellipse([x1 + 105, cy - 15, x1 + 135, cy + 15], fill="#C53030")
-        draw.ellipse([x1 + 165, cy - 65, x1 + 225, cy - 15], outline="#2F855A", width=3, fill="#F0FFF4")
-        draw.ellipse([x1 + 215, cy - 85, x1 + 255, cy - 45], outline="#2F855A", width=3, fill="#F0FFF4")
-        draw.text((x1 + 70, cy + 65), "जनक यीस्ट कोशिका", font=f_lbl, fill="#1A202C")
-        draw.text((x1 + 240, cy - 35), "← मुकुल श्रृंखला (Buds)", font=f_lbl, fill="#22543D")
-
-    elif shape_type == "ovule":
-        draw.ellipse([cx - 95, cy - 85, cx + 95, cy + 85], outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.ellipse([cx - 75, cy - 68, cx + 75, cy + 68], outline="#3182CE", width=2, fill="#FFFFFF")
-        draw.ellipse([cx - 48, cy - 48, cx + 48, cy + 48], outline="#2F855A", width=3, fill="#F0FFF4")
-        # 3 प्रतिव्यासांत + 2 ध्रुवीय + 3 अंड उपकरण
-        for dx in (-22, 0, 22):
-            draw.ellipse([cx + dx - 6, cy - 36, cx + dx + 6, cy - 24], fill="#C53030")
-            draw.ellipse([cx + dx - 6, cy + 24, cx + dx + 6, cy + 36], fill="#2B6CB0")
-        draw.ellipse([cx - 10, cy - 6, cx + 10, cy + 6], fill="#D69E2E")
-        draw.line([(cx - 40, cy + 85), (cx - 40, cy + 125)], fill="#2D3748", width=4)
-        draw.text((x1 + 18, y1 + 18), "निभाग (Chalaza)", font=f_lbl, fill="#1A202C")
-        draw.text((x2 - 195, cy - 12), "← भ्रूणकोष (7-कोशिकीय)", font=f_lbl, fill="#22543D")
-        draw.text((x1 + 18, y2 - 42), "बीजांडद्वार (Micropyle)", font=f_lbl, fill="#C53030")
-
-    elif shape_type == "sperm":
-        # सिर (Head), ग्रीवा, मध्य भाग (माइटोकॉन्ड्रिया), पूँछ
-        draw.ellipse([x1 + 45, cy - 28, x1 + 115, cy + 28], outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.arc([x1 + 45, cy - 28, x1 + 85, cy + 28], start=90, end=270, fill="#C53030", width=5)
-        draw.rectangle([x1 + 115, cy - 12, x1 + 135, cy + 12], fill="#CBD5E0")
-        draw.rectangle([x1 + 135, cy - 18, x1 + 225, cy + 18], outline="#2F855A", width=3, fill="#F0FFF4")
-        pts = [(x1 + 225 + i * 18, cy + int(14 * math.sin(i * 0.9))) for i in range(15)]
-        draw.line(pts, fill="#2D3748", width=3)
-        draw.text((x1 + 35, cy - 58), "एक्रोसोम + केंद्रक (सिर)", font=f_lbl, fill="#C53030")
-        draw.text((x1 + 130, cy + 32), "माइटोकॉन्ड्रिया (ऊर्जा)", font=f_lbl, fill="#22543D")
-        draw.text((x1 + 340, cy - 42), "पूँछ (गतिशीलता)", font=f_lbl, fill="#1A202C")
-
-    elif shape_type == "dna_helix":
-        for i in range(28):
-            px = x1 + 55 + i * 15
-            off = int(48 * math.sin(i * 0.35))
-            y_top, y_bot = cy - off, cy + off
-            if i % 3 == 0:
-                draw.line([(px, y_top), (px, y_bot)], fill="#718096", width=2)
-            draw.ellipse([px - 5, y_top - 5, px + 5, y_top + 5], fill="#C53030")
-            draw.ellipse([px - 5, y_bot - 5, px + 5, y_bot + 5], fill="#2B6CB0")
-        draw.text((x1 + 35, y1 + 18), "5' → 3' शर्करा-फॉस्फेट रीढ़ | क्षार युग्म: A=T, G≡C (दूरी 3.4 Å, व्यास 20 Å)", font=f_lbl, fill="#1A202C")
-
-    elif shape_type == "antibody":
-        # Y-आकार H2L2 संरचना
-        draw.line([(cx - 12, cy + 85), (cx - 12, cy)], fill="#2B6CB0", width=6)
-        draw.line([(cx + 12, cy + 85), (cx + 12, cy)], fill="#2B6CB0", width=6)
-        draw.line([(cx - 12, cy), (cx - 75, cy - 65)], fill="#2B6CB0", width=6)
-        draw.line([(cx + 12, cy), (cx + 75, cy - 65)], fill="#2B6CB0", width=6)
-        # हल्की श्रृंखलाएँ (Light chains)
-        draw.line([(cx - 32, cy - 12), (cx - 92, cy - 72)], fill="#C53030", width=5)
-        draw.line([(cx + 32, cy - 12), (cx + 92, cy - 72)], fill="#C53030", width=5)
-        # डाइसल्फाइड बंध
-        draw.line([(cx - 12, cy + 18), (cx + 12, cy + 18)], fill="#D69E2E", width=3)
-        draw.text((x1 + 20, y1 + 18), "प्रतिजन बंधन स्थल (Antigen Binding Site)", font=f_lbl, fill="#C53030")
-        draw.text((x1 + 20, y2 - 42), "H₂L₂ संरचना • डाइसल्फाइड बंध (-S-S-)", font=f_lbl, fill="#1A365D")
-
-    elif shape_type == "bioreactor":
-        draw.rounded_rectangle([cx - 80, y1 + 35, cx + 80, y2 - 35], radius=25, outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.line([(cx, y1 + 15), (cx, y2 - 55)], fill="#2D3748", width=4)
-        for py in (cy - 30, cy + 25):
-            draw.line([(cx - 48, py), (cx + 48, py)], fill="#C53030", width=5)
-        draw.text((x1 + 18, y1 + 25), "मोटर व शाफ्ट", font=f_lbl, fill="#1A202C")
-        draw.text((cx + 90, cy - 15), "← विलोडक (Impeller)", font=f_lbl, fill="#C53030")
-        draw.text((x1 + 18, y2 - 42), "निर्जीवाणु वायु व pH नियंत्रण", font=f_lbl, fill="#22543D")
-
-    elif shape_type == "pyramid":
-        # पारिस्थितिक पिरामिड (ऊर्जा का सीधा पिरामिड)
-        levels = [
-            (220, "उत्पादक (10,000 J)", "#C6F6D5"),
-            (165, "प्राथमिक उपभोक्ता (1,000 J)", "#FEFCBF"),
-            (110, "द्वितीयक उपभोक्ता (100 J)", "#FED7D7"),
-            (60, "तृतीयक (10 J)", "#E9D8FD"),
-        ]
-        bot_y = y2 - 32
-        lh = 44
-        for half_w, lbl, col in levels:
-            draw.rectangle([cx - half_w, bot_y - lh, cx + half_w, bot_y], fill=col, outline="#2D3748", width=2)
-            lw = f_lbl.getlength(lbl)
-            draw.text((cx - lw / 2, bot_y - lh + 10), lbl, font=f_lbl, fill="#1A202C")
-            bot_y -= lh
-
-    else:
-        # सामान्य नामांकित आरेख बॉक्स (Generic Multi-Stage Bio Diagram)
-        draw.rounded_rectangle([x1 + 25, y1 + 25, x2 - 25, y2 - 25], radius=18, outline="#2F855A", width=3, fill="#F0FFF4")
-        draw.ellipse([cx - 65, cy - 45, cx + 65, cy + 45], outline="#2B6CB0", width=3, fill="#EBF8FF")
-        draw.text((x1 + 40, y1 + 36), "मुख्य संरचना एवं नामांकित भाग (BSEB VVI)", font=f_lbl, fill="#1A365D")
-
-
-def render_bio_diagrams_sheet(ch_name: str, diagrams: list[dict]) -> io.BytesIO:
-    """बायोलॉजी के किसी अध्याय के सभी महत्वपूर्ण डायग्राम एक ही HD पेज पर बनाकर देता है।"""
-    f_title, f_sub, f_bold, f_body = get_fonts(0.95)
-    W = 1280
-    TOP_H = 155
-    CARD_H = 330
-    H = TOP_H + len(diagrams) * CARD_H + 80
-
-    img = Image.new("RGB", (W, H), "#FFFDF7")
-    draw = ImageDraw.Draw(img)
-
-    draw.rectangle([0, 0, W, TOP_H], fill="#EDF2F7")
-    draw.line([(0, TOP_H), (W, TOP_H)], fill="#2F855A", width=4)
-    draw.text((55, 28), f"🧬 {ch_name}", font=f_title, fill="#1A365D")
-    draw.text((55, 82), "Bihar Board Class 12th • सभी महत्वपूर्ण नामांकित चित्र (All Chapter Diagrams)", font=f_sub, fill="#2F855A")
-
-    cur_y = TOP_H + 20
-    for idx, diag in enumerate(diagrams, 1):
-        box = (50, cur_y, W - 50, cur_y + CARD_H - 20)
-        draw.rounded_rectangle(box, radius=16, fill="#FFFFFF", outline="#CBD5E0", width=2)
-        draw.rectangle([50, cur_y, W - 50, cur_y + 46], fill="#F7FAFC")
-        draw.text((70, cur_y + 8), f"{idx}. {diag['title']}", font=f_bold, fill="#1A202C")
-
-        # बाईं ओर आरेख, दाईं ओर परीक्षा-उपयोगी नामांकन बिंदु
-        diag_box = (65, cur_y + 52, 650, cur_y + CARD_H - 65)
-        draw_bio_shape(draw, diag.get("shape", "generic"), diag_box, f_sub)
-
-        py = cur_y + 62
-        for pt in diag.get("points", []):
-            wrapped_pts = wrap_text_lines(f"• {pt}", f_bold, f_body, W - 720)
-            for wline, _ in wrapped_pts[:2]:
-                draw.text((675, py), wline, font=f_body, fill="#2D3748")
-                py += 36
-        cur_y += CARD_H
-
-    draw.text((55, H - 48), "Sanskari Study • Biology Single-Page Diagram Sheet", font=f_sub, fill="#718096")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    buf.seek(0)
-    return buf
+    return questions
 
 
 # ================= OFFLINE 1-TO-1 MCQ GENERATOR (ZERO API NEEDED) =================
 def build_formula_mcqs(formulas: list[tuple[str, str, str]]) -> list[dict]:
-    """
-    प्रत्येक फॉर्मूले के लिए 1 अलग MCQ बनाता है (उदा. 38 फॉर्मूले = 38 MCQs)।
-    कोई बाहरी API नहीं—100% ऑफलाइन और सटीक!
-    """
     if not formulas:
         return []
     mcqs = []
@@ -544,7 +306,6 @@ def build_formula_mcqs(formulas: list[tuple[str, str, str]]) -> list[dict]:
     all_names = [f[0] for f in formulas]
 
     for i, (fname, fexpr, funit) in enumerate(formulas):
-        # बारी-बारी से सूत्र पूछें या सूत्र का नाम/मात्रक पूछें ताकि सभी 100% फॉर्मूले कवर हों
         if i % 2 == 0 and len(set(all_exprs)) >= 4:
             q_text = f"'{fname}' का सही सूत्र / व्यंजक क्या है?"
             correct_val = fexpr
@@ -568,10 +329,6 @@ def build_formula_mcqs(formulas: list[tuple[str, str, str]]) -> list[dict]:
 
 
 def build_lang_mcqs(item: dict, all_items: list[dict], is_hindi: bool) -> list[dict]:
-    """
-    हिंदी या इंग्लिश पाठ के नोट्स की हर एक जानकारी (लेखक, विधा, जन्म, निधन, जन्म स्थान, माता, पिता, रचना)
-    से अलग-अलग MCQ तैयार करता है—100% ऑफलाइन।
-    """
     mcqs = []
     ch = item["ch"]
 
@@ -614,9 +371,7 @@ def build_lang_mcqs(item: dict, all_items: list[dict], is_hindi: bool) -> list[d
         make_q(f"Which works/honours belong to {item['author']}?", item["works"], "works", ["Gitanjali, The Home and the World", "Malgudi Days, The Guide", "Lyrical Ballads, The Prelude"])
 
     return mcqs
-
-
-# ================= COMPLETE PHYSICS FORMULAS (ALL 14 CHAPTERS) =================
+        # ================= COMPLETE PHYSICS FORMULAS (ALL 14 CHAPTERS) =================
 PHYSICS_DATA = {
     "title": "⚛️ Physics (भौतिकी)",
     "chapters": [
@@ -825,7 +580,7 @@ PHYSICS_DATA = {
             "name": "8. वैद्युतचुंबकीय तरंगें",
             "formulas": [
                 ("विस्थापन धारा (Displacement Current I_d)", "I_d = ε₀ (dΦ_E / dt)", "SI मात्रक: ऐम्पियर (A)"),
-                ("ऐम्पियर-मैक्सवेल नियम", "∮ B⃗ · dl⃗ = μ₀ (I_c + ε₀ dΦ_E/dt)", "I_c = चालन धारा"),
+                ("ऐम्पियर-मैक्सवेल नियम", "∮ B⃗ · dl⃗ =                ("ऐम्पियर-मैक्सवेल नियम", "∮ B⃗ · dl⃗ = μ₀ (I_c + ε₀ dΦ_E/dt)", "I_c = चालन धारा"),
                 ("निर्वात में विद्युतचुंबकीय तरंग की चाल", "c = 1 / √(μ₀ε₀) = 3 × 10⁸ m/s", "सभी EM तरंगों की निर्वात में चाल समान"),
                 ("माध्यम में विद्युतचुंबकीय तरंग की चाल", "v = 1 / √(με) = c / √(μᵣεᵣ) = c / n", "n = माध्यम का अपवर्तनांक"),
                 ("विद्युत व चुंबकीय क्षेत्र के आयामों में संबंध", "E₀ / B₀ = c", "E⃗ ⊥ B⃗ ⊥ तरंग संचरण की दिशा (E⃗ × B⃗)"),
@@ -971,6 +726,7 @@ PHYSICS_DATA = {
         },
     ],
 }
+
 # ================= COMPLETE CHEMISTRY FORMULAS & REACTIONS (ALL 16 CHAPTERS) =================
 CHEMISTRY_DATA = {
     "title": "🧪 Chemistry (रसायन शास्त्र)",
@@ -1006,20 +762,7 @@ CHEMISTRY_DATA = {
                 ("द्रव्यमान प्रतिशत (% w/w)", "% w/w = (विलेय का द्रव्यमान / विलयन का द्रव्यमान) × 100", "ताप से अप्रभावित"),
                 ("आयतन प्रतिशत (% v/v)", "% v/v = (विलेय का आयतन / विलयन का आयतन) × 100", "ताप पर निर्भर"),
                 ("पार्ट्स प्रति मिलियन (ppm)", "ppm = (विलेय के भागों की संख्या / कुल भाग) × 10⁶", "अति तनु विलयनों की सांद्रता हेतु"),
-                ("मोल अंश / मोल प्रभाज (Mole Fraction χ)", "χ_A = n_A / (n_A + n_B),  χ_A + χ_B = 1", "विमाहीन व ताप से स्वतंत्र"),
-                ("मोलरता (Molarity M)", "M = विलेय के मोल (n) / विलयन का आयतन (लीटर में)", "SI मात्रक: mol/L, ताप बढ़ाने पर घटती है"),
-                ("मोललता (Molality m)", "m = विलेय के मोल (n) / विलायक का द्रव्यमान (kg में)", "SI मात्रक: mol/kg, ताप से स्वतंत्र"),
-                ("नॉर्मलता (Normality N)", "N = विलेय के ग्राम तुल्यांक / विलयन का आयतन (L में)", "N = M × n-फैक्टर"),
-                ("तनुकरण समीकरण (Dilution Formula)", "M₁ V₁ = M₂ V₂  तथा  N₁ V₁ = N₂ V₂", "मिश्रण: M = (M₁V₁ + M₂V₂)/(V₁ + V₂)"),
-                ("हेनरी का नियम (Henry's Law)", "p = K_H · χ", "K_H = हेनरी स्थिरांक (ताप बढ़ने पर K_H बढ़ता है)"),
-                ("वाष्पशील द्रवों हेतु राउल्ट का नियम", "P_total = P°_A χ_A + P°_B χ_B", "P_A = P°_A χ_A, P_B = P°_B χ_B"),
-                ("वाष्प दाब का आपेक्षिक अवनमन (RLVP)", "(P°_A - P_A) / P°_A = χ_B = n_B / (n_A + n_B)", "तनु विलयन हेतु: ΔP/P°_A ≈ n_B / n_A"),
-                ("क्वथनांक में उन्नयन (Elevation in Boiling Point)", "ΔT_b = T_b - T°_b = K_b · m", "K_b = मोलल उन्नयन स्थिरांक (K·kg/mol)"),
-                ("क्वथनांक उन्नयन से विलेय का अणुभार (M_B)", "M_B = (1000 × K_b × w_B) / (ΔT_b × w_A)", "w_B = विलेय भार, w_A = विलायक भार (g में)"),
-                ("हिमांक में अवनमन (Depression in Freezing Point)", "ΔT_f = T°_f - T_f = K_f · m", "K_f = मोलल अवनमन स्थिरांक (K·kg/mol)"),
-                ("हिमांक अवनमन से विलेय का अणुभार (M_B)", "M_B = (1000 × K_f × w_B) / (ΔT_f × w_A)", "जल हेतु K_f = 1.86 K·kg/mol"),
-                ("परासरण दाब (Osmotic Pressure π - वांट हॉफ)", "π = C R T = (n_B / V) R T", "R = 0.0821 L·atm/(K·mol)"),
-                ("परासरण दाब से विलेय का अणुभार (M_B)", "M_B = (w_B × R × T) / (π × V)", "बृहदाणुओं (प्रोटीन/बहुलक) हेतु सर्वोत्तम विधि"),
+                ("मोल अंश / मोल प्रभाज (Mole Fraction χ)", "χ_A = n_A / (n                ("परासरण दाब से विलेय का अणुभार (M_B)", "M_B = (w_B × R × T) / (π × V)", "बृहदाणुओं (प्रोटीन/बहुलक) हेतु सर्वोत्तम विधि"),
                 ("वांट हॉफ गुणांक (van't Hoff Factor i)", "i = प्रेक्षित अणुसंख्य गुणधर्म / सैद्धांतिक गुणधर्म", "सैद्धांतिक अणुभार / प्रेक्षित अणुभार"),
                 ("वियोजन की मात्रा (Degree of Dissociation α)", "α = (i - 1) / (n - 1)", "n = प्रति अणु उत्पन्न कुल आयनों की संख्या"),
                 ("संगुणन की मात्रा (Degree of Association α)", "α = (1 - i) / (1 - 1/n)", "डाइमर (n=2) हेतु: α = 2(1 - i)"),
@@ -1194,6 +937,73 @@ CHEMISTRY_DATA = {
                 ("फेहलिंग परीक्षण (Fehling's Test)", "R-CHO + 2Cu²⁺ + 5OH⁻ → R-COO⁻ + Cu₂O↓ (लाल-भूरा) + 3H₂O", "ऐलिफैटिक ऐल्डिहाइड देते हैं, बेन्जैल्डिहाइड नहीं देता"),
                 ("आयोडोफॉर्म परीक्षण (Iodoform Test)", "CH₃-CO- या CH₃-CH(OH)- समूह + I₂ + NaOH → CHI₃↓ (पीला अवक्षेप)", "एथेनॉल, एसीटैल्डिहाइड व मेथिल कीटोन देते हैं"),
                 ("हैल-वोल्हार्ड-ज़ेलिंस्की अभिक्रिया (HVZ Reaction)", "R-CH₂-COOH + X₂ (लाल P) → H₂O → R-CH(X)-COOH", "α-हैलोकार्बोक्सिलिक अम्ल निर्माण"),
+                ("कार्बोक्सिलिक अम्लों की अम्लीय प्रबलता नियम", "अम्लीय प्रबलता ∝ -I प्रभाव  तथा  ∝ 1 / (+I प्रभाव)", "CF₃COOH > CCl₃COOH > HCOOH > CH₃COOH"),
+            ],
+        },
+        {
+            "name": "13. ऐमीन",
+            "formulas": [
+                ("हॉफमान ब्रोमामाइड निम्नीकरण अभिक्रिया", "R-CONH₂ + Br₂ + 4NaOH → R-NH₂ + Na₂CO₃ + 2NaBr + 2H₂O", "एमाइड से एक कार्बन कम वाला 1° ऐमीन बनता है"),
+                ("गैब्रिएल थैलिमाइड संश्लेषण (Gabriel Synthesis)", "थैलिमाइड + KOH + R-X → NaOH(aq) → R-NH₂ (शुद्ध 1° ऐलिफैटिक ऐमीन)", "ऐरोमैटिक ऐमीन (ऐनिलीन) इससे नहीं बन सकता"),
+                ("कार्बिलऐमीन अभिक्रिया (आइसोसायनाइड परीक्षण)", "R-NH₂ + CHCl₃ + 3KOH (ऐल्को.) → R-NC (दुर्गंधयुक्त) + 3KCl + 3H₂O", "केवल प्राथमिक (1°) ऐमीन देते हैं (2° व 3° नहीं)"),
+                ("हिंसबर्ग अभिकर्मक (Hinsberg Reagent) परीक्षण", "अभिकर्मक: बेन्जीन सल्फोनिल क्लोराइड (C₆H₅SO₂Cl)", "1° उत्पाद KOH में विलेय | 2° अविलेय | 3° अभिक्रिया नहीं करता"),
+                ("ऐलिफैटिक ऐमीनों की क्षारीय प्रबलता (जलीय विलयन)", "मेथिल: (CH₃)₂NH > CH₃NH₂ > (CH₃)₃N > NH₃ (2° > 1° > 3°)", "एथिल: (C₂H₅)₂NH > (C₂H₅)₃N > C₂H₅NH₂ > NH₃ (2° > 3° > 1°)"),
+                ("गैसीय प्रावस्था में ऐमीनों की क्षारीयता क्रम", "3° ऐमीन > 2° ऐमीन > 1° ऐमीन > NH₃", "केवल +I प्रभाव पर निर्भर"),
+                ("डाइऐजोकरण अभिक्रिया (Diazotisation)", "C₆H₅NH₂ + NaNO₂ + 2HCl (273–278 K / 0–5°C) → C₆H₅N₂⁺Cl⁻ + NaCl + 2H₂O", "बेन्जीन डाइऐजोनियम क्लोराइड निर्माण"),
+                ("युग्मन अभिक्रिया (Coupling Reaction - ऐजो रंजक)", "C₆H₅N₂⁺Cl⁻ + फीनॉल (OH⁻) → p-हाइड्रॉक्सीऐजोबेन्जीन (नारंगी रंजक)", "ऐनिलीन के साथ पीला रंजक बनता है"),
+                ("ऐनिलीन का ब्रोमीनीकरण (Bromination)", "C₆H₅NH₂ + 3Br₂ (जल) → 2,4,6-ट्राइब्रोमोऐनिलीन (सफेद अवक्षेप)", "-NH₂ समूह अत्यधिक सक्रियणकारी है"),
+            ],
+        },
+        {
+            "name": "14. जैव-अणु",
+            "formulas": [
+                ("कार्बोहाइड्रेट का सामान्य सूत्र", "C_x(H₂O)_y", "ग्लूकोज व फ्रक्टोज दोनों का अणुसूत्र: C₆H₁₂O₆"),
+                ("ग्लूकोज व फ्रक्टोज में क्रियात्मक समूह अंतर", "ग्लूकोज: ऐल्डोहेक्सोज (-CHO समूह) | फ्रक्टोज: कीटोहेक्सोज (>C=O समूह)", "ग्लूकोज में 4 किरैल (असममित) कार्बन होते हैं"),
+                ("प्रमुख डाइसैकेराइड्स के जल-अपघटन उत्पाद", "सुक्रोज → ग्लूकोज + फ्रक्टोज | माल्टोज → 2 ग्लूकोज | लैक्टोज → ग्लूकोज + गैलैक्टोज", "सुक्रोज एक अनअपचायी शर्करा (Non-reducing) है"),
+                ("स्टार्च के दो मुख्य घटक", "ऐमिलोज (15-20%, जल में विलेय) + ऐमिलोपेक्टिन (80-85%, जल में अविलेय)", "दोनों α-D-ग्लूकोज के बहुलक हैं"),
+                ("पेप्टाइड बंध (Peptide Linkage)", "-CO-NH- बंध (दो α-ऐमीनो अम्लों के संघनन से निर्मित)", "प्रोटीन α-ऐमीनो अम्लों के बहुलक हैं"),
+                ("ज़्विटर आयन (Zwitter Ion)", "H₃N⁺-CHR-COO⁻ (उभयधर्मी द्विध्रुवीय आयन)", "समविभव बिंदु (Isoelectric Point) पर कुल आवेश शून्य"),
+                ("DNA व RNA के नाइट्रोजनी क्षारक", "DNA: A, G, C, T (थायमीन)  |  RNA: A, G, C, U (यूरैसिल)", "DNA में द्विकुंडली, RNA में एकल रज्जुक संरचना"),
+                ("चारगाफ का क्षार युग्मन नियम (Chargaff's Rule)", "A = T (2 हाइड्रोजन बंध)  तथा  G ≡ C (3 हाइड्रोजन बंध)", "(A + G) / (T + C) = 1"),
+                ("जल व वसा में विलेय विटामिन", "जल में विलेय: विटामिन B समूह व C | वसा में विलेय: विटामिन A, D, E, K", "विटामिन B₁₂ में कोबाल्ट (Co) धातु पाई जाती है"),
+                ("विटामिनों के रासायनिक नाम व कमी से रोग", "A (रेटिनॉल - रतौंधी) | B₁ (थायमीन - बेरी-बेरी) | C (एस्कॉर्बिक अम्ल - स्कर्वी) | D (कैल्सिफेरॉल - रिकेट्स)", "K (फिलोक्विनोन - रक्त का थक्का न जमना)"),
+            ],
+        },
+        {
+            "name": "15. बहुलक",
+            "formulas": [
+                ("पॉलिथीन (Polythene) का एकलक व प्रकार", "एकलक: एथीन (CH₂=CH₂)  →  -(CH₂-CH₂)ₙ-", "योगात्मक समबहुलक (Ziegler-Natta उत्प्रेरक से HDPE)"),
+                ("टेफ्लॉन (PTFE - नॉन-स्टिक बर्तन)", "एकलक: टेट्राफ्लोरोएथीन (CF₂=CF₂)  →  -(CF₂-CF₂)ₙ-", "ऊष्मा व रसायन प्रतिरोधी"),
+                ("PVC (पॉलिवाइनिल क्लोराइड)", "एकलक: वाइनिल क्लोराइड (CH₂=CHCl)  →  -(CH₂-CHCl)ₙ-", "पाइप व रेनकोट निर्माण में"),
+                ("ऑरलॉन / एक्रिलन (PAN)", "एकलक: एक्रिलोनाइट्राइल (CH₂=CH-CN)", "कृत्रिम ऊन (स्वेटर) निर्माण में"),
+                ("प्राकृतिक रबर (Natural Rubber)", "एकलक: आइसोप्रीन (2-मेथिल-1,3-ब्यूटाडाइन)", "सिस-1,4-पॉलिआइसोप्रीन; वल्कनीकरण में 3-5% सल्फर मिलाते हैं"),
+                ("निओप्रीन (संश्लेषित रबर)", "एकलक: क्लोरोप्रीन (2-क्लोरो-1,3-ब्यूटाडाइन)", "तेल व पेट्रोल प्रतिरोधी रबर"),
+                ("ब्यूना-S (Buna-S) सहबहुलक", "एकलक: 1,3-ब्यूटाडाइन + स्टाइरीन", "टायर व जूते के सोल निर्माण में"),
+                ("ब्यूना-N (Buna-N) सहबहुलक", "एकलक: 1,3-ब्यूटाडाइन + एक्रिलोनाइट्राइल", "तेल सील व टैंक अस्तर निर्माण में"),
+                ("नायलॉन-6,6 (Nylon-6,6 - पॉलिऐमाइड)", "एकलक: हेक्सामेथिलीनडाइऐमीन + ऐडिपिक अम्ल", "संघनन बहुलक (ऐमाइड बंध -CONH-)"),
+                ("नायलॉन-6 (Nylon-6)", "एकलक: कैप्रोलैक्टम (Caprolactam)", "रस्सियाँ व टायर कॉर्ड बनाने में"),
+                ("टेरिलीन / डेक्रॉन (Terylene - पॉलिएस्टर)", "एकलक: एथिलीन ग्लाइकॉल + टेरेफ्थैलिक अम्ल", "एस्टर बंध (-COO-) युक्त संघनन बहुलक"),
+                ("बैकेलाइट (Bakelite - तापद्रढ़ बहुलक)", "एकलक: फीनॉल + फॉर्मेल्डिहाइड (HCHO)", "विद्युत स्विच व कंघी निर्माण (तिर्यकबद्ध बहुलक)"),
+                ("जैव-निम्नीकरणीय बहुलक (Biodegradable)", "PHBV (3-हाइड्रॉक्सीब्यूटाइरेट + 3-हाइड्रॉक्सीवैलेरेट) तथा नायलॉन-2-नायलॉन-6", "पर्यावरण अनुकूल बहुलक"),
+            ],
+        },
+        {
+            "name": "16. दैनिक जीवन में रसायन",
+            "formulas": [
+                ("प्रशांतक (Tranquilizers - तनाव निवारक)", "इक्वैनिल, वेरोनल, ल्यूमिनल, क्लोरडाइएजेपॉक्साइड", "केंद्रीय तंत्रिका तंत्र पर कार्य करते हैं"),
+                ("पीड़ाहारी (Analgesics - दर्द निवारक)", "अस्वापक: ऐस्पिरिन, पैरासिटामोल | स्वापक (Narcotic): मॉर्फीन, हेरोइन, कोडीन", "ऐस्पिरिन = ऐसीटिल सैलिसिलिक अम्ल (ज्वरनाशी भी है)"),
+                ("प्रतिजैविक (Antibiotics)", "जीवाणुनाशी: पेनिसिलिन, ऑफ्लॉक्सासिन | जीवाणुनिरोधी: टेट्रासाइक्लिन, क्लोरैम्फेनिकॉल", "प्रथम प्रतिजैविक पेनिसिलिन (अलेक्जेंडर फ्लेमिंग)"),
+                ("पूतिरोधी (Antiseptics - जीवित ऊतकों पर)", "डेटॉल (क्लोरोजाइलिनॉल + टर्पिनिऑल), बिथियोनल (साबुन में), टिंक्चर आयोडीन (2-3% I₂)", "घाव साफ करने हेतु सुरक्षित"),
+                ("विसंक्रामी (Disinfectants - निर्जीव वस्तुओं पर)", "1% फीनॉल विलयन, क्लोरीन (0.2–0.4 ppm), SO₂", "0.2% फीनॉल पूतिरोधी, जबकि 1% फीनॉल विसंक्रामी है"),
+                ("प्रतिअम्ल (Antacids - एसिडिटी निवारक)", "रैनिटिडीन (ज़ैन्टैक), सिमेटिडीन, ओमेप्राजोल, Mg(OH)₂", "आमाशय में अत्यधिक HCl को उदासीन करते हैं"),
+                ("प्रतिहिस्टैमिन (Antihistamines - एलर्जी निवारक)", "ब्रोमफेनिरामिन (डिमेंटैप), टर्फेनाडिन (सेल्डेन)", "हिस्टैमिन के प्रभाव को रोकते हैं"),
+                ("कृत्रिम मधुरक (Artificial Sweeteners)", "सैकेरीन (550 गुना मीठा), ऐस्पार्टेम (100 गुना - केवल ठंडे खाद्य में), सुक्रालोज (600 गुना), ऐलिटेम (2000 गुना)", "मधुमेह रोगियों हेतु शून्य कैलोरी विकल्प"),
+                ("खाद्य परिरक्षक (Food Preservatives)", "सोडियम बेन्जोएट (C₆H₅COONa), साधारण नमक, शर्करा, वनस्पति तेल", "भोजन को सूक्ष्मजीवों से खराब होने से बचाते हैं"),
+                ("साबुन व संश्लेषित अपमार्जक में अंतर", "साबुन कठोर जल (Ca²⁺, Mg²⁺) में अवक्षेप बनाता है; अपमार्जक कठोर जल में भी झाग देता है", "धनायनिक अपमार्जक: सेटिलट्राइमेथिलअमोनियम ब्रोमाइड"),
+            ],
+        },
+    ],
+}
                 ("कार्बोक्सिलिक अम्लों की अम्लीय प्रबलता नियम", "अम्लीय प्रबलता ∝ -I प्रभाव  तथा  ∝ 1 / (+I प्रभाव)", "CF₃COOH > CCl₃COOH > HCOOH > CH₃COOH"),
             ],
         },
@@ -1450,6 +1260,7 @@ MATH_DATA = {
             "name": "13. प्रायिकता",
             "formulas": [
                 ("सप्रतिबंध प्रायिकता (Conditional Probability)", "P(E | F) = P(E ∩ F) / P(F)  (जहाँ P(F) ≠ 0)", "घटना F घटित होने पर E की प्रायिकता"),
+                             ("सप्रतिबंध प्रायिकता (Conditional Probability)", "P(E | F) = P(E ∩ F) / P(F)  (जहाँ P(F) ≠ 0)", "घटना F घटित होने पर E की प्रायिकता"),
                 ("प्रायिकता का गुणन नियम (Multiplication Theorem)", "P(E ∩ F) = P(E) · P(F | E) = P(F) · P(E | F)", "संयुक्त घटना की प्रायिकता"),
                 ("स्वतंत्र घटनाओं (Independent Events) की शर्त", "P(E ∩ F) = P(E) · P(F)", "यदि E व F स्वतंत्र हैं तो E' व F' भी स्वतंत्र होंगी"),
                 ("संपूर्ण प्रायिकता प्रमेय (Total Probability Theorem)", "P(A) = Σ P(E_i) · P(A | E_i)", "E₁, E₂... प्रतिदर्श समष्टि का विभाजन हैं"),
@@ -1461,8 +1272,7 @@ MATH_DATA = {
     ],
 }
 
-
-# ================= COMPLETE BIOLOGY DATA (ALL 16 CHAPTERS + 1-PAGE DIAGRAMS) =================
+# ================= COMPLETE BIOLOGY DATA (ALL 16 CHAPTERS + TEXT DIAGRAM GUIDES) =================
 BIOLOGY_DATA = {
     "title": "🧬 Biology (जीव विज्ञान)",
     "chapters": [
@@ -1474,25 +1284,14 @@ BIOLOGY_DATA = {
                 ("गुणसूत्र संख्या (2n बनाम n)", "मनुष्य: 2n=46 (n=23) | मटर: 2n=14 | धान: 2n=24 | मक्का: 2n=20 | फलमक्खी: 2n=8", "ऑफियोग्लॉसम (फर्न): 2n = 1260 (सर्वाधिक)"),
                 ("निषेचन व भ्रूणोद्भव नियम", "युग्मक सदैव अगुणित (n) व युग्मनज (Zygote) सदैव द्विगुणित (2n) होता है", "अनिषेकजनन (Parthenogenesis): मधुमक्खी, रोटीफर, टर्की"),
             ],
-            "diagrams": [
-                {
-                    "title": "अमीबा में द्विखंडन (Binary Fission in Amoeba)",
-                    "shape": "binary_fission",
-                    "points": [
-                        "पहले केंद्रक लंबा होकर दो भागों में विभाजित (कैरियोकाइनेसिस) होता है।",
-                        "इसके बाद कोशिकाद्रव्य विभाजित होकर दो समान पुत्री अमीबा बनाता है।",
-                        "यह अलैंगिक जनन की सबसे सरल विधि है।",
-                    ],
-                },
-                {
-                    "title": "यीस्ट में मुकुलन (Budding in Yeast)",
-                    "shape": "budding",
-                    "points": [
-                        "जनक कोशिका पर एक छोटा उभार (मुकुल/Bud) बनता है।",
-                        "केंद्रक विभाजित होकर मुकुल में प्रवेश करता है और मुकुल श्रृंखला बनती है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. अमीबा में द्विखंडन (Binary Fission):\n"
+                "   • चरण-1: जनक अमीबा कोशिका → चरण-2: केंद्रक लंबा होकर दो भागों में विभाजित (कैरियोकाइनेसिस) → चरण-3: कोशिकाद्रव्य विभाजन (साइटोकाइनेसिस) → चरण-4: दो पुत्री अमीबा।\n\n"
+                "2. यीस्ट में मुकुलन (Budding in Yeast):\n"
+                "   • जनक कोशिका पर छोटा उभार (मुकुल) → केंद्रक विभाजन → मुकुल श्रृंखला निर्माण।\n\n"
+                "3. अन्य प्रमुख VVI आरेख:\n"
+                "   • क्लैमाइडोमोनास के चलबीजाणु (Zoospores) • पेनिसिलियम के कोनिडिया • स्पंज के जेम्यूल (Gemmules) • ब्रायोफिलम की अपस्थानिक कलिकाएँ।"
+            ),
         },
         {
             "name": "2. पुष्पी पादपों में लैंगिक जनन",
@@ -1503,17 +1302,14 @@ BIOLOGY_DATA = {
                 ("द्विनिषेचन (Double Fertilization - नवाश्चिन)", "सत्य निषेचन: नर युग्मक(n) + अंड(n) → युग्मनज(2n) | त्रिसंलयन: नर युग्मक(n) + द्वितीयक केंद्रक(2n) → PEN(3n)", "आवृतबीजी पादपों का अद्वितीय लक्षण; भ्रूणपोष त्रिगुणित (3n) होता है"),
                 ("असंगजनन व बहुभ्रूणता (Apomixis & Polyembryony)", "बिना निषेचन बीज निर्माण = असंगजनन | एक बीज में अनेक भ्रूण = बहुभ्रूणता (संतरा, नींबू)", "खोजकर्ता: ल्यूवेनहॉक (सिट्रस में)"),
             ],
-            "diagrams": [
-                {
-                    "title": "प्रतीप बीजांड एवं 7-कोशिकीय भ्रूणकोष (Anatropous Ovule)",
-                    "shape": "ovule",
-                    "points": [
-                        "बीजांडद्वार (Micropyle) की ओर अंड उपकरण (1 अंड कोशिका + 2 सहायक कोशिकाएँ + तंतुरूप समुच्चय) स्थित होता है।",
-                        "निभाग (Chalaza) की ओर 3 प्रतिव्यासांत कोशिकाएँ (Antipodals) होती हैं।",
-                        "मध्य में बड़ी केंद्रीय कोशिका में 2 ध्रुवीय केंद्रक (Polar Nuclei) होते हैं।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. प्रतीप बीजांड (Anatropous Ovule) के मुख्य भाग:\n"
+                "   • बीजांडवृंत (Funicle) • नाभिका (Hilum) • अध्यावरण (Integuments) • बीजांडद्वार (Micropyle) • निभाग (Chalaza) • बीजांडकाय (Nucellus) • भ्रूणकोष (Embryo Sac)।\n\n"
+                "2. परिपक्व भ्रूणकोष (7-कोशिकीय, 8-केंद्रकीय):\n"
+                "   • निभाग सिरा: 3 प्रतिव्यासांत कोशिकाएँ (Antipodals)\n"
+                "   • मध्य भाग: 1 बड़ी केंद्रीय कोशिका जिसमें 2 ध्रुवीय केंद्रक (Polar Nuclei)\n"
+                "   • बीजांडद्वार सिरा: अंड उपकरण (1 अंड कोशिका + 2 सहायक कोशिकाएँ + तंतुरूप समुच्चय)।"
+            ),
         },
         {
             "name": "3. मानव जनन",
@@ -1523,17 +1319,15 @@ BIOLOGY_DATA = {
                 ("आर्तव चक्र (Menstrual Cycle - 28 दिन)", "अंडोत्सर्ग (Ovulation): 14वें दिन (LH सर्ज के कारण) | कॉर्पस ल्यूटियम: प्रोजेस्टेरोन का स्राव", "गर्भधारण न होने पर कॉर्पस ल्यूटियम नष्ट हो जाता है"),
                 ("गर्भकलाएँ व अपरा (Placenta) हार्मोन", "अपरा द्वारा स्रावित हार्मोन: hCG, hPL, एस्ट्रोजन, प्रोजेस्टेरोन व रिलैक्सिन", "मानव में सगर्भता अवधि (Gestation): लगभग 9 माह (266–280 दिन)"),
             ],
-            "diagrams": [
-                {
-                    "title": "मानव शुक्राणु की संरचना (Structure of Human Sperm)",
-                    "shape": "sperm",
-                    "points": [
-                        "सिर (Head): अगुणित केंद्रक तथा आगे टोपीनुमा एक्रोसोम (हायल्यूरोनिडेज एंजाइम युक्त)।",
-                        "मध्य भाग (Middle Piece): अनेक सर्पिलाकार माइटोकॉन्ड्रिया जो तैरने हेतु ATP ऊर्जा देते हैं।",
-                        "पूँछ (Tail): निषेचन स्थल तक गतिशीलता प्रदान करती है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. मानव शुक्राणु की संरचना (Structure of Human Sperm):\n"
+                "   • सिर (Head): अगुणित केंद्रक + आगे टोपीनुमा एक्रोसोम (हायल्यूरोनिडेज एंजाइम युक्त)।\n"
+                "   • ग्रीवा (Neck): समीपस्थ व दूरस्थ तारककेंद्र।\n"
+                "   • मध्य भाग (Middle Piece): सर्पिलाकार माइटोकॉन्ड्रिया (ऊर्जा स्रोत)।\n"
+                "   • पूँछ (Tail): गतिशीलता प्रदान करती है।\n\n"
+                "2. ग्राफी पुटक (Graafian Follicle) व अंडाणु की संरचना:\n"
+                "   • द्वितीयक अंडक • जोना पेलुसिडा (Zona Pellucida) • कोरोना रेडिएटा • एंट्रम गुहा।"
+            ),
         },
         {
             "name": "4. जनन स्वास्थ्य",
@@ -1543,17 +1337,13 @@ BIOLOGY_DATA = {
                 ("स्थायी बंध्यकरण (Sterilization)", "पुरुष नसबंदी: वैसेक्टॉमी (Vasectomy - शुक्रवाहक काटना) | महिला नसबंदी: ट्यूबेक्टॉमी (Tubectomy)", "शल्य क्रिया द्वारा स्थायी गर्भनिरोधन"),
                 ("सहायक जनन प्रौद्योगिकियाँ (ART Full Forms)", "IVF-ET (टेस्ट ट्यूब बेबी), ZIFT (युग्मनज अंतः डिंबवाहिनी स्थानांतरण - 8 ब्लास्टोमियर तक), GIFT, ICSI, AI", "ZIFT: 8 ब्लास्टोमियर तक; IUT: 8 से अधिक ब्लास्टोमियर"),
             ],
-            "diagrams": [
-                {
-                    "title": "गर्भनिरोधक एवं ART तकनीक तुलना चार्ट",
-                    "shape": "generic",
-                    "points": [
-                        "प्राकृतिक विधियाँ: आवधिक संयम (10–17वाँ दिन), बाह्य स्खलन, स्तनपान अनार्तव।",
-                        "हार्मोनल IUDs: प्रोजेस्टासर्ट, LNG-20; औषधिरहित IUD: लिप्पेस लूप।",
-                        "STIs (यौन संचारित रोग): एड्स, सिफलिस, गोनोरिया, जननिक हर्पीस।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. शल्य क्रियात्मक गर्भनिरोधन आरेख:\n"
+                "   • वैसेक्टॉमी (पुरुष): शुक्रवाहक (Vas deferens) को काटकर बाँधना।\n"
+                "   • ट्यूबेक्टॉमी (महिला): अंडवाहिनी (Fallopian tube) को काटकर बाँधना।\n\n"
+                "2. IUDs प्रकार:\n"
+                "   • औषधिरहित: लिप्पेस लूप | ताँबा मोचक: CuT, Cu7, Multiload-375 | हार्मोन मोचक: Progestasert, LNG-20।"
+            ),
         },
         {
             "name": "5. वंशागति तथा विविधता के सिद्धांत",
@@ -1566,17 +1356,13 @@ BIOLOGY_DATA = {
                 ("लिंग निर्धारण प्रकार (Sex Determination)", "मनुष्य व ड्रोसोफिला: XX-XY (नर विषमयुग्मकी) | पक्षी: ZZ-ZW (मादा विषमयुग्मकी)", "मधुमक्खी: अगुणित-द्विगुणित (नर n=16, मादा 2n=32)"),
                 ("गुणसूत्रीय विकार (Chromosomal Disorders)", "डाउन सिंड्रोम: 21वीं त्रिगुणसूत्रता (47) | क्लाइनफेल्टर: 44+XXY (47, बंध्य नर) | टर्नर: 44+XO (45, बंध्य मादा)", "मेंडेलियन विकार: हीमोफीलिया, वर्णांधता, सिकल सेल एनीमिया"),
             ],
-            "diagrams": [
-                {
-                    "title": "द्विसंकर संकरण (9:3:3:1) एवं गुणसूत्रीय वंशागति आरेख",
-                    "shape": "generic",
-                    "points": [
-                        "गोल-पीला (RRYY) × झुर्रीदार-हरा (rryy) → F₁ में सभी गोल-पीले (RrYy)।",
-                        "F₂ पीढ़ी में 16 संयोगों से 9 गोल-पीले : 3 गोल-हरे : 3 झुर्रीदार-पीले : 1 झुर्रीदार-हरा।",
-                        "वंशागति का क्रोमोसोम सिद्धांत: सटन एवं बोवेरी (1902)।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. पुनेट वर्ग (Punnett Square) — द्विसंकर संकरण:\n"
+                "   • जनक: RRYY (गोल-पीला) × rryy (झुर्रीदार-हरा) → F₁: RrYy (सभी गोल-पीले)।\n"
+                "   • F₂ अनुपात: 9 गोल-पीले : 3 गोल-हरे : 3 झुर्रीदार-पीले : 1 झुर्रीदार-हरा।\n\n"
+                "2. वंशावली विश्लेषण (Pedigree Symbols):\n"
+                "   • वर्ग (□) = नर | वृत्त (○) = मादा | भरा हुआ (■/●) = रोगग्रस्त व्यक्ति | क्षैतिज रेखा = विवाह।"
+            ),
         },
         {
             "name": "6. वंशागति के आणविक आधार",
@@ -1588,16 +1374,14 @@ BIOLOGY_DATA = {
                 ("आनुवंशिक कूट (Genetic Code) की विशेषताएँ", "कुल कोडॉन = 64 (61 ऐमीनो अम्ल हेतु + 3 समापन कोडॉन: UAA, UAG, UGA)", "प्रारंभन कोडॉन: AUG (मेथिओनिन) — सर्वव्यापी व अपहासित (Degenerate)"),
                 ("लैक ओपेरॉन (Lac Operon - जैकब एवं मोनाड)", "z-जीन: β-गैलेक्टोसिडेज | y-जीन: परमिएज | a-जीन: ट्रांसऐसीटाइलेज | प्रेरक (Inducer): लैक्टोज", "DNA फिंगरप्रिंटिंग जनक: एलेक जेफ्रीज (VNTR पर आधारित)"),
             ],
-            "diagrams": [
-                {
-                    "title": "DNA द्विकुंडली संरचना (Watson-Crick Double Helix)",
-                    "shape": "dna_helix",
-                    "points": [
-                        "दोनों पॉलिन्यूक्लियोटाइड शृंखलाएँ प्रतिसमानांतर (5'→3' तथा 3'→5') होती हैं।",
-                        "एडेनीन (A) थायमीन (T) से 2 H-बंध द्वारा और ग्वानीन (G) साइटोसीन (C) से 3 H-बंध द्वारा जुड़ता है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. DNA द्विकुंडली (Double Helix) लेबलिंग:\n"
+                "   • प्रतिसमानांतर शृंखलाएँ (5'→3' व 3'→5') • शर्करा-फॉस्फेट रीढ़ • क्षार युग्म: A=T (2 H-बंध), G≡C (3 H-बंध)।\n\n"
+                "2. लैक ओपेरॉन (Lac Operon) घटक:\n"
+                "   • नियामक जीन (i) → दमनकारी प्रोटीन (Repressor) • उन्नायक (P) • प्रचालक (O) • संरचनात्मक जीन (z, y, a)।\n\n"
+                "3. tRNA (क्लोवर लीफ मॉडल):\n"
+                "   • 3' सिरे पर ऐमीनो अम्ल बंधन स्थल (CCA) • निचले लूप पर प्रतिप्रकूट (Anticodon) लूप।"
+            ),
         },
         {
             "name": "7. विकास (Evolution)",
@@ -1607,16 +1391,12 @@ BIOLOGY_DATA = {
                 ("प्रमुख विकास सिद्धांत व वैज्ञानिक", "मिलर-यूरी प्रयोग (1953): CH₄, NH₃, H₂ व जलवाष्प (800°C) से ऐमीनो अम्ल निर्माण", "डार्विन: प्राकृतिक वरण; लैमार्क: उपार्जित लक्षणों की वंशागति; ह्यूगो डी व्रीज: उत्परिवर्तन"),
                 ("मानव विकास का सही क्रम एवं कपाल क्षमता", "ड्रायोपिथेकस → रामापिथेकस → ऑस्ट्रेलोपिथेकस → होमो हैबिलिस (650–800 cc) → होमो इरेक्टस (900 cc) → निएंडरथल (1400 cc) → होमो सेपियंस", "अत्यंत महत्वपूर्ण ऑब्जेक्टिव क्रम"),
             ],
-            "diagrams": [
-                {
-                    "title": "मिलर-यूरी प्रयोग एवं अनुकूली विकिरण (Adaptive Radiation)",
-                    "shape": "generic",
-                    "points": [
-                        "CH₄ : NH₃ : H₂ का अनुपात 2 : 1 : 2 रखा गया था।",
-                        "गैलापैगोस द्वीप की डार्विन फिंचें अनुकूली विकिरण का सर्वश्रेष्ठ उदाहरण हैं।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. स्टेनली मिलर का चिंगारी विसर्जन उपकरण (1953):\n"
+                "   • बड़ा फ्लास्क: CH₄ : NH₃ : H₂ (2:1:2 अनुपात) + टंगस्टन इलेक्ट्रोड (800°C विद्युत चिंगारी) → संघनित्र → ऐमीनो अम्ल (ग्लाइसीन, ऐलानीन) प्राप्त।\n\n"
+                "2. अनुकूली विकिरण (Adaptive Radiation):\n"
+                "   • गैलापैगोस द्वीप की डार्विन फिंचें व ऑस्ट्रेलियाई मार्सुपियल।"
+            ),
         },
         {
             "name": "8. मानव स्वास्थ्य तथा रोग",
@@ -1626,16 +1406,12 @@ BIOLOGY_DATA = {
                 ("प्रतिरक्षी अणु (Antibody) की संरचना", "H₂L₂ संरचना (2 भारी शृंखलाएँ + 2 हल्की शृंखलाएँ, डाइसल्फाइड बंध द्वारा जुड़ी)", "प्रमुख प्रकार: IgG, IgA (कोलोस्ट्रम में), IgM, IgE (एलर्जी में), IgD"),
                 ("AIDS एवं कैंसर (AIDS & Cancer)", "HIV (रेट्रोवायरस) सहायक T-लिम्फोसाइट्स (TH) को नष्ट करता है | परीक्षण: ELISA", "कैंसर जाँच: बायोप्सी, CT स्कैन, MRI; ऑन्कोजीन सक्रियण से अनियंत्रित कोशिका विभाजन"),
             ],
-            "diagrams": [
-                {
-                    "title": "प्रतिरक्षी अणु की H₂L₂ संरचना (Structure of Antibody)",
-                    "shape": "antibody",
-                    "points": [
-                        "Y-आकार के अणु में दो लंबी भारी (Heavy) व दो छोटी हल्की (Light) पॉलिपेप्टाइड शृंखलाएँ होती हैं।",
-                        "ऊपरी सिरों पर प्रतिजन बंधन स्थल (Antigen Binding Site) स्थित होता है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. प्रतिरक्षी अणु (Antibody - H₂L₂) संरचना:\n"
+                "   • Y-आकार अणु • 2 लंबी भारी (Heavy) व 2 छोटी हल्की (Light) पॉलिपेप्टाइड शृंखलाएँ • डाइसल्फाइड बंध (-S-S-) • ऊपरी सिरे पर प्रतिजन बंधन स्थल (Antigen Binding Site)।\n\n"
+                "2. प्लाज्मोडियम जीवन चक्र:\n"
+                "   • संक्रामक अवस्था: स्पोरोजोइट (Sporozoite) → मानव यकृत कोशिका → RBC विखंडन (हीमोजोइन स्राव) → मादा एनोफिलीज मच्छर में युग्मकजनन।"
+            ),
         },
         {
             "name": "9. खाद्य उत्पादन में वृद्धि की कार्यनीति",
@@ -1644,16 +1420,10 @@ BIOLOGY_DATA = {
                 ("पशुपालन व मधुमक्खी पालन", "अंतःप्रजनन अवसादन दूर करने हेतु बहिःसंकरण (Out-crossing) करते हैं | MOET तकनीक: पशु प्रजनन", "भारतीय मधुमक्खी: एपिस इंडिका (Apis indica)"),
                 ("ऊतक संवर्धन व एकल कोशिका प्रोटीन (SCP)", "पूर्णशक्तता (Totipotency): एक पादप कोशिका से पूर्ण पौधा बनना | विषाणु मुक्त पौधे: विभज्योतक (Meristem) संवर्धन से", "SCP उदाहरण: स्पिरुलिना (Spirulina) व मिथाइलोफिलस मिथाइलोट्रोपस"),
             ],
-            "diagrams": [
-                {
-                    "title": "पादप ऊतक संवर्धन एवं संकरण चरण (Tissue Culture)",
-                    "shape": "generic",
-                    "points": [
-                        "कर्तोतक (Explant) → कैलस (Callus) निर्माण → ऑक्सिन व साइटोकाइनिन हार्मोन → सूक्ष्मप्रवर्धन (Micropropagation)।",
-                        "कायिक संकरण (Somatic Hybridization): पोमैटो (आलू + टमाटर प्रोटोप्लास्ट संलयन)।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. पादप ऊतक संवर्धन (Tissue Culture) चरण:\n"
+                "   • कर्तोतक (Explant) चयन → निर्जीवीकरण → पोषक माध्यम में संवर्धन → कैलस (Callus) निर्माण → ऑक्सिन व साइटोकाइनिन हार्मोन द्वारा जड़-तना विभेदन → सूक्ष्मप्रवर्धन (Micropropagation)।"
+            ),
         },
         {
             "name": "10. मानव कल्याण में सूक्ष्मजीव",
@@ -1663,16 +1433,10 @@ BIOLOGY_DATA = {
                 ("वाहितमल उपचार व BOD नियम", "BOD (Biochemical Oxygen Demand) ∝ जल प्रदूषण (BOD जितना अधिक, जल उतना ही अधिक प्रदूषित)", "बायोगैस का मुख्य घटक: मीथेन (CH₄, 50–70%) — मीथेनोजेन जीवाणु द्वारा"),
                 ("जैव-नियंत्रक व जैव-उर्वरक (Biocontrol & Biofertilizers)", "Bt कपास: बैसिलस थुरिनजिएंसिस | बैकुलोवायरस (न्यूक्लिओपॉलीहेड्रोवायरस): प्रजाति-विशिष्ट कीट नियंत्रण", "जैव-उर्वरक: राइजोबियम, एजोटोबैक्टर, एनाबीना, नॉस्टॉक, माइकोराइजा (Glomus)"),
             ],
-            "diagrams": [
-                {
-                    "title": "बायोगैस संयंत्र एवं वाहितमल उपचार चरण (Biogas Plant)",
-                    "shape": "generic",
-                    "points": [
-                        "गोबर + जल (कर्दम/Slurry) → अवायवीय पाचक टैंक (मीथेनोजेन जीवाणु) → CH₄ + CO₂ + H₂S गैस।",
-                        "प्राथमिक उपचार (भौतिक छनन व अवसादन) तथा द्वितीयक उपचार (जैविक ऊर्णक / Flocs द्वारा BOD कम करना)।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. प्रारूपी बायोगैस संयंत्र (Biogas Plant):\n"
+                "   • गोबर + जल (कर्दम/Slurry) टैंक → भूमिगत अवायवीय पाचक (10-15 फीट गहरा) → गैस होल्डर (CH₄ + CO₂ + H₂S) → गैस निकास पाइप व खाद निकासी टैंक।"
+            ),
         },
         {
             "name": "11. जैव प्रौद्योगिकी - सिद्धांत व प्रक्रम",
@@ -1682,16 +1446,12 @@ BIOLOGY_DATA = {
                 ("क्लोनिंग संवाहक pBR322 की विशेषताएँ", "ori (प्रतिकृति की उत्पत्ति), rop, तथा दो प्रतिजैविक प्रतिरोधी जीन: ampᴿ (ऐम्पिसिलिन) व tetᴿ (टेट्रासाइक्लिन)", "Ti प्लाज्मिड: एग्रोबैक्टीरियम ट्यूमीफेशियंस (पादपों का प्राकृतिक आनुवंशिक इंजीनियर)"),
                 ("PCR (Polymerase Chain Reaction) के 3 चरण", "1. निष्क्रियकरण (Denaturation - 94°C) → 2. तापानुशीलन (Annealing - 55°C) → 3. प्रसार (Extension - 72°C)", "एंजाइम: Taq पॉलिमरेज (Thermus aquaticus जीवाणु से प्राप्त तापस्थायी एंजाइम)"),
             ],
-            "diagrams": [
-                {
-                    "title": "साधारण विलोडित हौज बायो-रिएक्टर (Simple Stirred-Tank Bioreactor)",
-                    "shape": "bioreactor",
-                    "points": [
-                        "बेलनाकार टैंक जिसमें घुमावदार विलोडक (Impeller) ऑक्सीजन व पोषकों को समान रूप से मिलाता है।",
-                        "ताप, pH नियंत्रण, झाग नियंत्रक व निर्जीवाणु वायु आपूर्ति प्रणाली लगी होती है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. क्लोनिंग संवाहक pBR322 का मानचित्र:\n"
+                "   • प्रतिबंधन स्थल: EcoRI, ClaI, HindIII, BamHI, SalI (tetᴿ में), PvuI, PstI (ampᴿ में) • ori स्थल • rop स्थल।\n\n"
+                "2. साधारण विलोडित हौज बायो-रिएक्टर (Stirred-Tank Bioreactor):\n"
+                "   • मोटर व विलोडक शाफ्ट • चपटे ब्लेड वाले इम्पेलर • झाग नियंत्रक • pH व ताप नियंत्रक • निर्जीवाणु वायु आपूर्ति।"
+            ),
         },
         {
             "name": "12. जैव प्रौद्योगिकी एवं उसके उपयोग",
@@ -1701,16 +1461,11 @@ BIOLOGY_DATA = {
                 ("आनुवंशिक रूप से निर्मित इंसुलिन (Humulin)", "A-पेप्टाइड (21 ऐमीनो अम्ल) + B-पेप्टाइड (30 ऐमीनो अम्ल) डाइसल्फाइड बंध से जुड़े; परिपक्व इंसुलिन में C-पेप्टाइड नहीं होता", "1983 में Eli Lilly कंपनी द्वारा E. coli से निर्मित"),
                 ("प्रथम जीन चिकित्सा (Gene Therapy - 1990)", "4 वर्षीय बालिका में ADA (एडीनोसीन डिएमिनेज) एंजाइम की कमी को दूर करने हेतु रेट्रोवायरस संवाहक द्वारा किया गया", "GEAC: Genetic Engineering Approval Committee"),
             ],
-            "diagrams": [
-                {
-                    "title": "प्राक्-इंसुलिन का परिपक्व इंसुलिन में रूपांतरण (Maturation of Insulin)",
-                    "shape": "generic",
-                    "points": [
-                        "प्राक्-इंसुलिन में A, B तथा C तीन पॉलिपेप्टाइड शृंखलाएँ होती हैं।",
-                        "परिपक्वन के दौरान C-पेप्टाइड अलग हो जाता है और A व B शृंखलाएँ डाइसल्फाइड बंध से जुड़ जाती हैं।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. प्राक्-इंसुलिन का परिपक्व इंसुलिन में रूपांतरण:\n"
+                "   • प्राक्-इंसुलिन (Pro-insulin): A-पेप्टाइड + B-पेप्टाइड + मुक्त C-पेप्टाइड।\n"
+                "   • परिपक्व इंसुलिन: C-पेप्टाइड हट जाता है और A व B शृंखलाएँ दो डाइसल्फाइड बंधों से जुड़ जाती हैं।"
+            ),
         },
         {
             "name": "13. जीव और समष्टियाँ",
@@ -1720,16 +1475,11 @@ BIOLOGY_DATA = {
                 ("संभार-तंत्र वृद्धि समीकरण (Logistic Growth - S-आकार / सिग्मॉइड)", "dN / dt = r N [(K - N) / K]", "K = पोषण क्षमता (Carrying Capacity); सीमित संसाधन हेतु यथार्थवादी मॉडल"),
                 ("समष्टि पारस्परिक क्रियाएँ (Population Interactions)", "सहोपकारिता (+, +) | परभक्षण (+, -) | परजीविता (+, -) | स्पर्धा (-, -) | सहभोजिता (+, 0) | अंतरजातीय परजीविता (-, 0)", "सहोपकारिता उदाहरण: लाइकेन, माइकोराइजा, अंजीर व बर्र"),
             ],
-            "diagrams": [
-                {
-                    "title": "समष्टि वृद्धि वक्र (J-आकार चरघातांकी बनाम S-आकार लॉजिस्टिक वक्र)",
-                    "shape": "generic",
-                    "points": [
-                        "J-आकार वक्र: असीमित भोजन व स्थान होने पर तीव्र वृद्धि (dN/dt = rN)।",
-                        "S-आकार वक्र: पश्चता प्रावस्था → त्वरण प्रावस्था → मंदन → अनंतस्पर्शी (K पर स्थिर)।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. समष्टि वृद्धि वक्र (Population Growth Curves):\n"
+                "   • वक्र-a (J-आकार): चरघातांकी वृद्धि (dN/dt = rN) — असीमित संसाधन।\n"
+                "   • वक्र-b (S-आकार / सिग्मॉइड): लॉजिस्टिक वृद्धि (dN/dt = rN[(K-N)/K]) — पोषण क्षमता (K) रेखा पर स्थिर।"
+            ),
         },
         {
             "name": "14. पारितंत्र",
@@ -1739,16 +1489,11 @@ BIOLOGY_DATA = {
                 ("पारिस्थितिक पिरामिड के नियम", "ऊर्जा का पिरामिड सदैव सीधा (Always Upright) होता है", "समुद्र में जैवभार (Biomass) का पिरामिड उल्टा (Inverted) होता है"),
                 ("अपघटन के 5 प्रमुख चरण", "खंडन (Fragmentation) → निक्षालन (Leaching) → अपचयन (Catabolism) → ह्यूमीफिकेशन → खनिजीकरण", "केंचुआ: अपरदाहारी (Detritivore)"),
             ],
-            "diagrams": [
-                {
-                    "title": "ऊर्जा का पारिस्थितिक पिरामिड (10% ऊर्जा प्रवाह नियम)",
-                    "shape": "pyramid",
-                    "points": [
-                        "आधार पर उत्पादक (10,000 J) → प्राथमिक उपभोक्ता (1,000 J) → द्वितीयक (100 J) → तृतीयक (10 J)।",
-                        "ऊर्जा का पिरामिड किसी भी पारितंत्र में कभी उल्टा नहीं हो सकता।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. ऊर्जा का पारिस्थितिक पिरामिड (10% नियम):\n"
+                "   • आधार: उत्पादक (10,000 J) → प्राथमिक उपभोक्ता (1,000 J) → द्वितीयक (100 J) → तृतीयक (10 J)।\n"
+                "   • नोट: ऊर्जा का पिरामिड सदैव सीधा (Upright) होता है।"
+            ),
         },
         {
             "name": "15. जैव-विविधता एवं संरक्षण",
@@ -1758,16 +1503,11 @@ BIOLOGY_DATA = {
                 ("जैव-विविधता क्षति के चार मुख्य कारण (The Evil Quartet)", "1. आवासीय क्षति एवं विखंडन (प्रमुख कारण) | 2. अति-दोहन | 3. विदेशी जातियों का आक्रमण | 4. सह-विलुप्तता", "पृथ्वी का फेफड़ा: अमेज़न वर्षा वन"),
                 ("स्व-स्थाने (In-situ) बनाम बाह्य-स्थाने (Ex-situ) संरक्षण", "In-situ: राष्ट्रीय उद्यान, अभयारण्य, बायोस्फीयर रिजर्व, हॉटस्पॉट (विश्व में 34, भारत में 3) | Ex-situ: चिड़ियाघर, वानस्पतिक उद्यान, बीज बैंक, निम्नताप परिरक्षण (-196°C द्रव N₂)", "रियो पृथ्वी सम्मेलन: 1992"),
             ],
-            "diagrams": [
-                {
-                    "title": "जाति-क्षेत्र संबंध ग्राफ एवं संरक्षण प्रकार",
-                    "shape": "generic",
-                    "points": [
-                        "सामान्य पैमाने पर S = CAᶻ आयताकार अतिपरवलय (Rectangular Hyperbola) वक्र बनाता है।",
-                        "लघुगणकीय पैमाने पर log S = log C + Z log A एक सीधी रेखा देता है।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. जाति-क्षेत्र संबंध ग्राफ (Species-Area Curve):\n"
+                "   • X-अक्ष: क्षेत्रफल (Area) | Y-अक्ष: जाति समृद्धि (Species Richness)।\n"
+                "   • सामान्य पैमाने पर आयताकार अतिपरवलय (S = CAᶻ) तथा लघुगणकीय पैमाने पर सीधी रेखा (log S = log C + Z log A)।"
+            ),
         },
         {
             "name": "16. पर्यावरण के मुद्दे",
@@ -1777,16 +1517,12 @@ BIOLOGY_DATA = {
                 ("जैव-आवर्धन (Biomagnification) व सुपोषण (Eutrophication)", "जैव-आवर्धन: खाद्य शृंखला में DDT / पारा की सांद्रता बढ़ना (जल 0.003 ppb → मछलीभक्षी पक्षी 25 ppm)", "सुपोषण: नाइट्रेट व फॉस्फेट से झील की प्राकृतिक काल-प्रभावन (शैवाल प्रस्फुटन)"),
                 ("ग्रीनहाउस गैसें व ओजोन क्षरण (मॉन्ट्रियल प्रोटोकॉल)", "ग्रीनहाउस योगदान: CO₂ (60%) > CH₄ (20%) > CFCs (14%) > N₂O (6%)", "ओजोन परत मापन इकाई: डॉबसन इकाई (DU); मॉन्ट्रियल प्रोटोकॉल: 1987 (कनाडा)"),
             ],
-            "diagrams": [
-                {
-                    "title": "ग्रीनहाउस गैस योगदान एवं जैव-आवर्धन (Biomagnification) पिरामिड",
-                    "shape": "pyramid",
-                    "points": [
-                        "जल (0.003 ppb) → प्राणिप्लवक (0.04 ppm) → छोटी मछली (0.5 ppm) → बड़ी मछली (2 ppm) → पक्षी (25 ppm)।",
-                        "चिपको आंदोलन (1974 - सुंदरलाल बहुगुणा) एवं अमृता देवी बिश्नोई वन्यजीव संरक्षण पुरस्कार।",
-                    ],
-                },
-            ],
+            "diagrams_text": (
+                "1. ग्रीनहाउस गैसों का सापेक्ष योगदान चार्ट:\n"
+                "   • CO₂ (60%) > मीथेन CH₄ (20%) > CFCs (14%) > N₂O (6%)।\n\n"
+                "2. जलीय खाद्य शृंखला में DDT का जैव-आवर्धन:\n"
+                "   • जल (0.003 ppb) → प्राणिप्लवक (0.04 ppm) → छोटी मछली (0.5 ppm) → बड़ी मछली (2 ppm) → मत्स्यभक्षी पक्षी (25 ppm)।"
+            ),
         },
     ],
 }
@@ -2411,7 +2147,7 @@ async def call_gemini_doubt(prompt: str, image_bytes: bytes | None = None) -> st
 # ================= KEYBOARD MENUS =================
 def root_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 Study Mode (पढ़ाई शुरू करें)", callback_data="mode_study")],
+        [InlineKeyboardButton("📖 Study / Viewer Mode (पढ़ाई व लाइव टेस्ट)", callback_data="mode_study")],
         [InlineKeyboardButton("🛠️ Admin / Manage Mode (Add • Edit • Delete)", callback_data="mode_admin")],
     ])
 
@@ -2419,9 +2155,10 @@ def root_mode_kb() -> InlineKeyboardMarkup:
 def study_features_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("1️⃣ 📁 My Study Vault (2h Auto-Delete)", callback_data="s_vault")],
-        [InlineKeyboardButton("2️⃣ 🧠 AI Doubt Solver", callback_data="s_doubt")],
+        [InlineKeyboardButton("2️⃣ 🧠 AI Doubt Solver (Fast Text)", callback_data="s_doubt")],
         [InlineKeyboardButton("3️⃣ 📚 Bihar Board Revision Bank (100% Offline)", callback_data="s_rev")],
         [InlineKeyboardButton("4️⃣ ⚠️ Mistake Bank (मेरी गलतियाँ)", callback_data="s_mis")],
+        [InlineKeyboardButton("5️⃣ 📝 HTML Live MCQ Test (Timer + Score)", callback_data="s_html_test")],
         [InlineKeyboardButton("🔄 Switch Mode (Study / Admin)", callback_data="root_home")],
     ])
 
@@ -2430,9 +2167,30 @@ def admin_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📁 Manage Study Vault (Subjects & Files)", callback_data="adm_vault")],
         [InlineKeyboardButton("⚠️ Manage Mistake Bank (Chapter Mistakes)", callback_data="adm_mis")],
-        [InlineKeyboardButton("📖 Switch to Study Mode", callback_data="mode_study")],
+        [InlineKeyboardButton("📝 Manage HTML Tests (Upload .html Test)", callback_data="adm_html_test")],
+        [InlineKeyboardButton("📖 Switch to Study / Viewer Mode", callback_data="mode_study")],
         [InlineKeyboardButton("🏠 Start Screen", callback_data="root_home")],
     ])
+
+
+def html_tests_kb(is_admin: bool) -> InlineKeyboardMarkup:
+    kb = []
+    for tid, tinfo in vault_data.get("tests", {}).items():
+        q_cnt = len(tinfo.get("questions", []))
+        if is_admin:
+            kb.append([
+                InlineKeyboardButton(f"📝 {tinfo['name'][:26]} ({q_cnt} Qs)", callback_data=f"ht_run:{tid}"),
+                InlineKeyboardButton("✏️", callback_data=f"ht_ren:{tid}"),
+                InlineKeyboardButton("🗑️", callback_data=f"ht_del:{tid}"),
+            ])
+        else:
+            kb.append([InlineKeyboardButton(f"▶️ {tinfo['name']} ({q_cnt} MCQs)", callback_data=f"ht_run:{tid}")])
+    if is_admin:
+        kb.append([InlineKeyboardButton("📤 नया HTML टेस्ट अपलोड करें (.html)", callback_data="ht_upload")])
+        kb.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="mode_admin")])
+    else:
+        kb.append([InlineKeyboardButton("⬅️ Study Menu", callback_data="mode_study")])
+    return InlineKeyboardMarkup(kb)
 
 
 def vault_subjects_kb(is_admin: bool) -> InlineKeyboardMarkup:
@@ -2557,9 +2315,9 @@ def admin_mistake_items_kb(subj: str, idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-# ================= STEALTH AUTH HANDLERS =================
+# ================= 24-HOUR STEALTH AUTH HANDLERS =================
 def is_authorized(user_id: int) -> bool:
-    return user_id == OWNER_ID and is_logged_in
+    return user_id == OWNER_ID and time.time() < login_expiry_ts
 
 
 async def cmd_suraj(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2567,64 +2325,101 @@ async def cmd_suraj(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != OWNER_ID:
         return  # बाहरी यूज़र के लिए पूरी तरह Silent
 
-    if is_logged_in:
+    if is_authorized(user_id):
+        rem_hrs = round((login_expiry_ts - time.time()) / 3600, 1)
         user_states.pop(user_id, None)
         await update.message.reply_text(
-            "👋 स्वागत है सूरज! <b>Sanskari Study</b> में अपना मोड चुनें:",
+            f"👋 स्वागत है सूरज! आपका 24h सेशन एक्टिव है (शेष ~{rem_hrs} घंटे)।\n<b>Sanskari Study</b> का मोड चुनें:",
             parse_mode="HTML",
             reply_markup=root_mode_kb(),
         )
         return
 
     user_states[user_id] = {"step": "AUTH_WAIT_PASS"}
-    await update.message.reply_text("🔐 पासवर्ड डालें:")
+    await update.message.reply_text("🔐 पासवर्ड डालें (एक बार डालने पर 24 घंटे वैध रहेगा):")
 
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_logged_in
+    global login_expiry_ts
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    if user_id != OWNER_ID:
         return
-    is_logged_in = False
+    login_expiry_ts = 0.0
     user_states.pop(user_id, None)
     await update.message.reply_text("🔒 लॉगआउट हो गया। दोबारा खोलने के लिए /suraj भेजें।")
 
 
-# ================= INTERACTIVE MCQ QUIZ ENGINE =================
+# ================= INTERACTIVE MCQ QUIZ ENGINE (WITH LIVE TIMER & MISTAKE REPORT) =================
 async def send_quiz_question(target_msg, user_id: int, context: ContextTypes.DEFAULT_TYPE, edit=False):
     st = user_states.get(user_id, {})
     quiz = st.get("quiz", {})
     questions = quiz.get("questions", [])
     q_idx = quiz.get("idx", 0)
+    start_ts = quiz.get("start_ts", time.time())
 
     if q_idx >= len(questions):
         score = quiz.get("score", 0)
         total = len(questions)
-        dur_sec = quiz.get("dur_sec", 300)
-        dur_label = quiz.get("dur_label", "5 मिनट")
-        summary = (
-            f"🏆 <b>क्विज़ पूरा हुआ!</b>\n"
+        wrong_list = quiz.get("wrongs", [])
+        elapsed_str = format_elapsed_time(time.time() - start_ts)
+        acc = round((score / total) * 100, 1) if total > 0 else 0
+        dur_sec = quiz.get("dur_sec", 600)
+        dur_label = quiz.get("dur_label", "10 मिनट")
+
+        header_report = (
+            f"🏆 <b>लाइव टेस्ट रिजल्ट (Live Test Report)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📘 <b>अध्याय:</b> {html.escape(quiz.get('title', ''))}\n"
-            f"🎯 <b>आपका स्कोर:</b> {score} / {total}\n"
-            f"⏳ <i>यह मैसेज {dur_label} में ऑटो-डिलीट हो जाएगा।</i>"
+            f"📘 <b>टेस्ट:</b> {html.escape(quiz.get('title', ''))}\n"
+            f"🎯 <b>फाइनल स्कोर:</b> {score} / {total} ({acc}%)\n"
+            f"✅ <b>सही:</b> {score}  |  ❌ <b>गलत:</b> {len(wrong_list)}\n"
+            f"⏱️ <b>कुल लगा समय:</b> {elapsed_str}\n"
+            f"⏳ <i>यह रिपोर्ट {dur_label} में ऑटो-डिलीट हो जाएगी।</i>"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]])
-        sent = await target_msg.edit_text(summary, parse_mode="HTML", reply_markup=kb) if edit else await target_msg.reply_text(summary, parse_mode="HTML", reply_markup=kb)
-        schedule_custom_delete(context, user_id, [sent.message_id], dur_sec)
+        sent_ids = []
+        first_msg = (
+            await target_msg.edit_text(header_report, parse_mode="HTML", reply_markup=kb if not wrong_list else None)
+            if edit
+            else await target_msg.reply_text(header_report, parse_mode="HTML", reply_markup=kb if not wrong_list else None)
+        )
+        sent_ids.append(first_msg.message_id)
+
+        if wrong_list:
+            labels = ["A", "B", "C", "D"]
+            w_lines = ["❌ <b>गलत हुए प्रश्नों की पूरी सूची (Review Mistakes):</b>\n━━━━━━━━━━━━━━━━━━━━"]
+            for w in wrong_list:
+                w_lines.append(
+                    f"\n<b>Q{w['q_num']}. {html.escape(w['q'])}</b>\n"
+                    f"   ❌ आपका उत्तर: {labels[w['chosen']]}) {html.escape(w['chosen_txt'])}\n"
+                    f"   ✅ सही उत्तर: <b>{labels[w['correct']]}) {html.escape(w['correct_txt'])}</b>"
+                )
+            chunks = split_long_text("\n".join(w_lines), 3700)
+            for c_i, ch_txt in enumerate(chunks):
+                m = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=ch_txt,
+                    parse_mode="HTML",
+                    reply_markup=kb if c_i == len(chunks) - 1 else None,
+                )
+                sent_ids.append(m.message_id)
+
+        schedule_custom_delete(context, user_id, sent_ids, dur_sec)
+        user_states.pop(user_id, None)
         return
 
     item = questions[q_idx]
     opts = item["options"]
     labels = ["A", "B", "C", "D"]
+    elapsed_now = format_elapsed_time(time.time() - start_ts)
     opt_lines = "\n".join([f"<b>{labels[i]})</b> {html.escape(opts[i])}" for i in range(4)])
 
     text = (
-        f"🎯 <b>प्रश्न {q_idx + 1} / {len(questions)}</b>\n"
+        f"🎯 <b>प्रश्न {q_idx + 1} / {len(questions)}</b>  |  ⏱️ <i>{elapsed_now}</i>\n"
+        f"📊 लाइव स्कोर: <b>{quiz.get('score', 0)}/{q_idx}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>{html.escape(item['q'])}</b>\n\n"
         f"{opt_lines}\n\n"
-        f"<i>सही विकल्प चुनें:</i>"
+        f"<i>सही विकल्प पर क्लिक करें:</i>"
     )
     kb = InlineKeyboardMarkup([
         [
@@ -2633,7 +2428,7 @@ async def send_quiz_question(target_msg, user_id: int, context: ContextTypes.DEF
             InlineKeyboardButton("C", callback_data="qz_ans:2"),
             InlineKeyboardButton("D", callback_data="qz_ans:3"),
         ],
-        [InlineKeyboardButton("🛑 क्विज़ समाप्त करें", callback_data="mode_study")],
+        [InlineKeyboardButton("🏁 टेस्ट अभी सबमिट करें (Result देखें)", callback_data="qz_finish_now")],
     ])
     if edit:
         await target_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -2641,22 +2436,22 @@ async def send_quiz_question(target_msg, user_id: int, context: ContextTypes.DEF
         await target_msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-# ================= TIMED ACTION EXECUTOR =================
+# ================= TIMED ACTION EXECUTOR (100% FAST TEXT — NO PHOTO GENERATION) =================
 async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: int, dur_label: str, context: ContextTypes.DEFAULT_TYPE, from_button=False):
     action = pending.get("action")
 
-    # 1. AI Doubt Hint
+    # 1. AI Doubt Hint (Fast Text)
     if action == "DOUBT_HINT":
         wait = await msg_obj.edit_text("💡 हिंट तैयार हो रहा है...") if from_button else await msg_obj.reply_text("💡 हिंट तैयार हो रहा है...")
         prompt = (
-            "आप बिहार बोर्ड कक्षा 12वीं के अनुभवी शिक्षक हैं। छात्र को इस प्रश्न का पूरा उत्तर न बताकर "
-            "केवल 1 से 2 लाइन का सटीक Hint (मुख्य सूत्र या पहला स्टेप) सरल हिंदी में दें।\n"
+            "आप बिहार बोर्ड कक्षा 12वीं के शिक्षक हैं। छात्र को इस प्रश्न का पूरा उत्तर न बताकर "
+            "केवल 1-2 लाइन का सटीक Hint (मुख्य सूत्र या पहला स्टेप) सरल हिंदी में दें।\n"
             f"प्रश्न: {pending.get('q_text', '')}"
         )
         try:
             ans = await call_gemini_doubt(prompt, pending.get("q_img"))
             out = await wait.edit_text(
-                f"💡 <b>Hint:</b>\n{html.escape(ans)}\n\n⏳ <i>यह मैसेज {dur_label} में ऑटो-डिलीट हो जाएगा।</i>",
+                f"💡 <b>Hint:</b>\n{html.escape(ans)}\n\n⏳ <i>{dur_label} में ऑटो-डिलीट होगा।</i>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]]),
             )
@@ -2664,49 +2459,45 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         except Exception as e:
             await wait.edit_text(f"⚠️ त्रुटि: {e}")
 
-    # 2. AI Doubt Board Solution
+    # 2. AI Doubt Solution (Fast Text — No Image Delay)
     elif action == "DOUBT_SOL":
         wait = (
-            await msg_obj.edit_text("📝 बिहार बोर्ड कॉपी स्टाइल में स्टेप-बाय-स्टेप सॉल्यूशन बन रहा है...")
+            await msg_obj.edit_text("📝 स्टेप-बाय-स्टेप सॉल्यूशन तैयार हो रहा है...")
             if from_button
-            else await msg_obj.reply_text("📝 बिहार बोर्ड कॉपी स्टाइल में स्टेप-बाय-स्टेप सॉल्यूशन बन रहा है...")
+            else await msg_obj.reply_text("📝 स्टेप-बाय-स्टेप सॉल्यूशन तैयार हो रहा है...")
         )
         prompt = (
-            "आप बिहार बोर्ड (BSEB) कक्षा 12वीं के बोर्ड परीक्षक हैं। नीचे दिए गए प्रश्न का बिल्कुल बिहार बोर्ड परीक्षा की "
-            "उत्तर-पुस्तिका जैसा 100% सटीक, स्टेप-बाय-स्टेप हल हिंदी में लिखें।\n"
-            "नियम:\n"
-            "1. 'दिया गया है:' लिखकर सभी मान व मात्रक लिखें।\n"
-            "2. 'चूँकि / नियमानुसार:' लिखकर संबंधित नियम या सिद्धांत लिखें।\n"
-            "3. 'सूत्र:' लिखें।\n"
-            "4. 'हल:' में एक-एक स्टेप स्पष्ट लिखें।\n"
-            "5. अंत में 'अतः:' लिखकर फाइनल उत्तर व SI मात्रक लिखें।\n"
-            "6. किसी भी LaTeX कोड ($ या \\frac) का उपयोग न करें; सीधे यूनिकोड चिह्न (×, ÷, √, π, θ, Δ, →, ², ³) लिखें।\n"
+            "आप बिहार बोर्ड (BSEB) कक्षा 12वीं के अनुभवी शिक्षक हैं। नीचे दिए गए प्रश्न का "
+            "100% सटीक, स्टेप-बाय-स्टेप हल सरल हिंदी में लिखें।\n"
+            "क्रम: 1) दिया गया है  2) सूत्र / नियम  3) चरणबद्ध हल  4) अंतिम उत्तर (SI मात्रक सहित)।\n"
+            "यूनिकोड गणित चिह्नों (×, ÷, √, π, θ, Δ, →, ², ³) का प्रयोग करें।\n"
             f"प्रश्न: {pending.get('q_text', '')}"
         )
         try:
             sol_text = await call_gemini_doubt(prompt, pending.get("q_img"))
-            pages = render_notebook_pages(
-                header_title="Bihar Board Step-by-Step Solution",
-                subtitle="BSEB Class 12th Board Exam Pattern",
-                body_text=sol_text,
+            full_msg = (
+                f"📝 <b>Bihar Board Step-by-Step Solution</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{html.escape(sol_text)}\n\n"
+                f"⏳ <i>{dur_label} में ऑटो-डिलीट होगा।</i>"
             )
+            chunks = split_long_text(full_msg, 3800)
             await wait.delete()
             sent_ids = []
-            for i, pbuf in enumerate(pages):
-                cap = f"📝 Board Solution (Page {i+1}/{len(pages)}) • ⏳ {dur_label} में ऑटो-डिलीट"
-                m = await context.bot.send_photo(chat_id=user_id, photo=pbuf, caption=cap)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]])
+            for i, ch_txt in enumerate(chunks):
+                m = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=ch_txt,
+                    parse_mode="HTML",
+                    reply_markup=kb if i == len(chunks) - 1 else None,
+                )
                 sent_ids.append(m.message_id)
-            nav = await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ पूरा सॉल्यूशन भेज दिया गया है (⏳ {dur_label} बाद ऑटो-डिलीट होगा)।",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]]),
-            )
-            sent_ids.append(nav.message_id)
             schedule_custom_delete(context, user_id, sent_ids, dur_sec)
         except Exception as e:
-            await wait.edit_text(f"⚠️ सॉल्यूशन बनाने में त्रुटि: {e}")
+            await wait.edit_text(f"⚠️ सॉल्यूशन त्रुटि: {e}")
 
-    # 3. Revision Bank: 1-Page Complete Formula Sheet (100% Offline)
+    # 3. Revision Bank: Complete Formulas in Fast Text (100% Offline)
     elif action == "REV_FORMULA_SHEET":
         subj, idx = pending["subj"], pending["idx"]
         sdata = REVISION_SUBJECTS[subj]
@@ -2715,60 +2506,74 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         formulas = ch_obj["formulas"]
 
         if from_button:
-            await msg_obj.delete()
+            try:
+                await msg_obj.delete()
+            except Exception:
+                pass
 
-        lines = []
+        lines = [
+            f"📘 <b>{html.escape(ch_name)}</b>",
+            f"<i>{html.escape(sdata['title'])} • कुल {len(formulas)} संपूर्ण सूत्र</i>",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
         for i, (fname, fexpr, funit) in enumerate(formulas, 1):
-            lines.append(f"{i}. {fname}:")
-            lines.append(f"   सूत्र: {fexpr}")
-            if funit:
-                lines.append(f"   विशेष: {funit}")
-            lines.append("")
+            unit_part = f"\n   📌 <i>{html.escape(funit)}</i>" if funit else ""
+            lines.append(f"\n<b>{i}. {html.escape(fname)}:</b>\n   🔹 <code>{html.escape(fexpr)}</code>{unit_part}")
+        lines.append(f"\n━━━━━━━━━━━━━━━━━━━━\n⏳ <i>यह मैसेज {dur_label} में ऑटो-डिलीट हो जाएगा।</i>")
 
-        sheet_buf = render_single_page_sheet(
-            header_title=ch_name,
-            subtitle=f"{sdata['title']} • कुल {len(formulas)} संपूर्ण सूत्र व नियम (1-Page Sheet)",
-            body_text="\n".join(lines),
-        )
-        photo_msg = await context.bot.send_photo(
-            chat_id=user_id,
-            photo=sheet_buf,
-            caption=f"📘 <b>{html.escape(ch_name)}</b> — सभी {len(formulas)} फॉर्मूले एक ही पेज पर\n⏳ <i>{dur_label} में ऑटो-डिलीट हो जाएगा।</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🎯 इन्हीं {len(formulas)} फॉर्मूलों का MCQ टेस्ट दें", callback_data=f"r_mcq_direct:{subj}:{idx}")],
-                [InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")],
-            ]),
-        )
-        schedule_custom_delete(context, user_id, [photo_msg.message_id], dur_sec)
+        chunks = split_long_text("\n".join(lines), 3800)
+        sent_ids = []
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🎯 इन्हीं {len(formulas)} फॉर्मूलों का MCQ टेस्ट दें", callback_data=f"r_mcq_direct:{subj}:{idx}")],
+            [InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")],
+        ])
+        for i, ch_txt in enumerate(chunks):
+            m = await context.bot.send_message(
+                chat_id=user_id,
+                text=ch_txt,
+                parse_mode="HTML",
+                reply_markup=kb if i == len(chunks) - 1 else None,
+            )
+            sent_ids.append(m.message_id)
+        schedule_custom_delete(context, user_id, sent_ids, dur_sec)
 
-    # 4. Revision Bank: Biology Single-Page Chapter Diagrams (100% Offline)
+    # 4. Revision Bank: Biology Chapter Diagrams Labeling in Fast Text (100% Offline)
     elif action == "REV_BIO_DIAGRAMS":
         idx = pending["idx"]
         ch_obj = BIOLOGY_DATA["chapters"][idx]
         ch_name = ch_obj["name"]
-        diagrams = ch_obj.get("diagrams", [])
+        diag_txt = ch_obj.get("diagrams_text", "इस अध्याय के मुख्य नामांकित चित्र पाठ्यपुस्तक के अनुसार तैयार करें।")
 
-        if from_button:
-            await msg_obj.delete()
-
-        diag_buf = render_bio_diagrams_sheet(ch_name, diagrams)
-        photo_msg = await context.bot.send_photo(
-            chat_id=user_id,
-            photo=diag_buf,
-            caption=f"🖼️ <b>{html.escape(ch_name)}</b> — सभी महत्वपूर्ण डायग्राम एक ही पेज पर\n⏳ <i>{dur_label} में ऑटो-डिलीट हो जाएगा।</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]]),
+        full_txt = (
+            f"🧬 <b>{html.escape(ch_name)} — महत्वपूर्ण डायग्राम एवं नामांकन</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{html.escape(diag_txt)}\n\n"
+            f"⏳ <i>{dur_label} में ऑटो-डिलीट हो जाएगा।</i>"
         )
-        schedule_custom_delete(context, user_id, [photo_msg.message_id], dur_sec)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Study Menu", callback_data="mode_study")]])
+        sent = (
+            await msg_obj.edit_text(full_txt, parse_mode="HTML", reply_markup=kb)
+            if from_button
+            else await msg_obj.reply_text(full_txt, parse_mode="HTML", reply_markup=kb)
+        )
+        schedule_custom_delete(context, user_id, [sent.message_id], dur_sec)
 
-    # 5. Revision Bank: Offline 1-to-1 Formula MCQs (Every Formula = 1 MCQ)
+    # 5. Revision Bank: Offline 1-to-1 Formula MCQs
     elif action == "REV_OFFLINE_MCQ":
         subj, idx = pending["subj"], pending["idx"]
         ch_obj = REVISION_SUBJECTS[subj]["chapters"][idx]
         qs = build_formula_mcqs(ch_obj["formulas"])
         user_states[user_id] = {
-            "quiz": {"title": ch_obj["name"], "questions": qs, "idx": 0, "score": 0, "dur_sec": dur_sec, "dur_label": dur_label}
+            "quiz": {
+                "title": ch_obj["name"],
+                "questions": qs,
+                "idx": 0,
+                "score": 0,
+                "wrongs": [],
+                "start_ts": time.time(),
+                "dur_sec": dur_sec,
+                "dur_label": dur_label,
+            }
         }
         await send_quiz_question(msg_obj, user_id, context, edit=from_button)
 
@@ -2823,7 +2628,16 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         item = all_list[idx]
         qs = build_lang_mcqs(item, all_list, is_hindi=(lang == "hin"))
         user_states[user_id] = {
-            "quiz": {"title": item["ch"], "questions": qs, "idx": 0, "score": 0, "dur_sec": dur_sec, "dur_label": dur_label}
+            "quiz": {
+                "title": item["ch"],
+                "questions": qs,
+                "idx": 0,
+                "score": 0,
+                "wrongs": [],
+                "start_ts": time.time(),
+                "dur_sec": dur_sec,
+                "dur_label": dur_label,
+            }
         }
         await send_quiz_question(msg_obj, user_id, context, edit=from_button)
 
@@ -2836,7 +2650,10 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         items = vault_data.get("mistakes", {}).get(key, [])
 
         if from_button:
-            await msg_obj.delete()
+            try:
+                await msg_obj.delete()
+            except Exception:
+                pass
 
         if not items:
             m = await context.bot.send_message(
@@ -2881,12 +2698,33 @@ async def execute_timed_action(msg_obj, user_id: int, pending: dict, dur_sec: in
         sent_ids.append(nav.message_id)
         schedule_custom_delete(context, user_id, sent_ids, dur_sec)
 
+    # 9. Feature 5: Start Uploaded HTML Live MCQ Test
+    elif action == "RUN_HTML_TEST":
+        tid = pending["tid"]
+        tinfo = vault_data.get("tests", {}).get(tid)
+        if not tinfo or not tinfo.get("questions"):
+            await msg_obj.edit_text("⚠️ यह टेस्ट उपलब्ध नहीं है।", reply_markup=study_features_kb())
+            return
+        user_states[user_id] = {
+            "quiz": {
+                "title": tinfo["name"],
+                "questions": tinfo["questions"],
+                "idx": 0,
+                "score": 0,
+                "wrongs": [],
+                "start_ts": time.time(),
+                "dur_sec": dur_sec,
+                "dur_label": dur_label,
+            }
+        }
+        await send_quiz_question(msg_obj, user_id, context, edit=from_button)
+
 
 async def prompt_for_duration(target, user_id: int, pending_action: dict, edit=True):
     user_states[user_id] = {"step": "WAIT_DURATION", "pending": pending_action}
     msg = (
         "⏳ <b>आप इसे कितने मिनट या घंटे तक देखना चाहते हैं?</b>\n\n"
-        "नीचे बटन चुनें या सीधे टाइप करके भेजें (जैसे: <code>5 मिनट</code>, <code>20 min</code>, <code>1 घंटा</code>):"
+        "नीचे बटन चुनें या सीधे टाइप करें (जैसे: <code>5 मिनट</code>, <code>20 min</code>, <code>1 घंटा</code>):"
     )
     if edit:
         await target.edit_text(msg, parse_mode="HTML", reply_markup=duration_prompt_kb())
@@ -2899,10 +2737,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
-    if not is_authorized(user_id):
+    if user_id != OWNER_ID:
         return  # बाहरी यूज़र के लिए पूरी तरह Silent
 
     await query.answer()
+
+    if not is_authorized(user_id):
+        user_states[user_id] = {"step": "AUTH_WAIT_PASS"}
+        await query.message.reply_text("🔐 आपका 24 घंटे का सेशन समाप्त हो गया है। कृपया पासवर्ड डालें:")
+        return
+
     cb = query.data
     parts = cb.split(":")
 
@@ -2913,7 +2757,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif cb == "mode_study":
         user_states[user_id] = {"mode": "STUDY"}
-        await query.edit_message_text("📖 <b>Study Mode</b>\nपढ़ने के लिए कोई भी फीचर चुनें:", parse_mode="HTML", reply_markup=study_features_kb())
+        await query.edit_message_text("📖 <b>Study / Viewer Mode</b>\nपढ़ाई या लाइव टेस्ट के लिए विकल्प चुनें:", parse_mode="HTML", reply_markup=study_features_kb())
 
     elif cb == "mode_admin":
         user_states[user_id] = {"mode": "ADMIN"}
@@ -3049,7 +2893,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cb == "s_doubt":
         user_states[user_id] = {"mode": "STUDY", "step": "DOUBT_WAIT_Q"}
         await query.edit_message_text(
-            "🧠 <b>Bihar Board AI Doubt Solver</b>\n\nकिसी भी प्रश्न (Physics, Chemistry, Biology, Maths, Hindi, English) की <b>फोटो भेजें</b> या <b>प्रश्न लिखकर भेजें</b>:",
+            "🧠 <b>Bihar Board AI Doubt Solver</b>\n\nकिसी भी प्रश्न की <b>फोटो भेजें</b> या <b>प्रश्न लिखकर भेजें</b>:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Study Menu", callback_data="mode_study")]]),
         )
@@ -3083,11 +2927,11 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch_obj = REVISION_SUBJECTS[subj]["chapters"][idx]
         fcnt = len(ch_obj["formulas"])
         btns = [
-            [InlineKeyboardButton(f"📝 1-Page Complete Formula Sheet ({fcnt} सूत्र)", callback_data=f"r_sheet_ask:{subj}:{idx}")],
-            [InlineKeyboardButton(f"🎯 All {fcnt} Formulas MCQ Test (Offline)", callback_data=f"r_mcq_ask:{subj}:{idx}")],
+            [InlineKeyboardButton(f"📝 All {fcnt} Formulas (Fast Text Sheet)", callback_data=f"r_sheet_ask:{subj}:{idx}")],
+            [InlineKeyboardButton(f"🎯 All {fcnt} Formulas Live MCQ Test", callback_data=f"r_mcq_ask:{subj}:{idx}")],
         ]
         if subj == "bio":
-            btns.append([InlineKeyboardButton("🖼️ Chapter Diagrams (एक ही पेज पर)", callback_data=f"r_diag_ask:{idx}")])
+            btns.append([InlineKeyboardButton("🧬 Chapter Diagrams & Labeling", callback_data=f"r_diag_ask:{idx}")])
         btns.append([InlineKeyboardButton("⬅️ Chapters", callback_data=f"r_subj:{subj}")])
         await query.edit_message_text(f"📘 <b>{html.escape(ch_obj['name'])}</b>\nविकल्प चुनें:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
@@ -3100,7 +2944,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif parts[0] in ("r_mcq_ask", "r_mcq_direct"):
         await prompt_for_duration(query.message, user_id, {"action": "REV_OFFLINE_MCQ", "subj": parts[1], "idx": int(parts[2])}, edit=True)
 
-    # Hindi & English Revision Bank
     elif cb == "r_hin":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✍️ गद्य खंड (13 पाठ)", callback_data="r_hin_sec:gadya")],
@@ -3135,7 +2978,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         back_cb = f"r_hin_sec:{sec}" if lang == "hin" else f"r_eng_sec:{sec}"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📝 लेखक / कवि परिचय (Notes)", callback_data=f"r_ln_ask:{lang}:{sec}:{idx}")],
-            [InlineKeyboardButton("🎯 सारे संभावित MCQ (Offline Test)", callback_data=f"r_lm_ask:{lang}:{sec}:{idx}")],
+            [InlineKeyboardButton("🎯 सारे संभावित Live MCQ Test", callback_data=f"r_lm_ask:{lang}:{sec}:{idx}")],
             [InlineKeyboardButton("⬅️ Chapters", callback_data=back_cb)],
         ])
         await query.edit_text(f"📘 <b>{html.escape(item['ch'])}</b>\nविकल्प चुनें:", parse_mode="HTML", reply_markup=kb)
@@ -3146,7 +2989,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif parts[0] in ("r_lm_ask", "r_lang_mcq_direct"):
         await prompt_for_duration(query.message, user_id, {"action": "REV_LANG_MCQ", "lang": parts[1], "sec": parts[2], "idx": int(parts[3])}, edit=True)
 
-    # Interactive MCQ Answer Checking
+    # Interactive MCQ Answer Checking (Records Wrong Answers + Live Timer)
     elif parts[0] == "qz_ans":
         chosen = int(parts[1])
         st = user_states.get(user_id, {})
@@ -3161,8 +3004,16 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if chosen == correct:
             quiz["score"] = quiz.get("score", 0) + 1
-            verdict = f"✅ <b>बिल्कुल सही जवाब! ({labels[correct]})</b>"
+            verdict = f"✅ <b>सही जवाब! ({labels[correct]})</b>"
         else:
+            quiz.setdefault("wrongs", []).append({
+                "q_num": q_idx + 1,
+                "q": item["q"],
+                "chosen": chosen,
+                "chosen_txt": item["options"][chosen],
+                "correct": correct,
+                "correct_txt": item["options"][correct],
+            })
             verdict = (
                 f"❌ <b>गलत जवाब!</b> आपने <b>{labels[chosen]}</b> चुना।\n"
                 f"✅ <b>सही उत्तर: {labels[correct]}) {html.escape(item['options'][correct])}</b>"
@@ -3171,8 +3022,8 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_txt = f"\n💡 <i>{html.escape(item['exp'])}</i>" if item.get("exp") else ""
         quiz["idx"] = q_idx + 1
 
-        next_label = "➡️ अगला प्रश्न" if quiz["idx"] < len(questions) else "🏆 फाइनल रिजल्ट देखें"
-        res_text = f"<b>प्रश्न {q_idx + 1}:</b> {html.escape(item['q'])}\n\n{verdict}{exp_txt}"
+        next_label = "➡️ अगला प्रश्न" if quiz["idx"] < len(questions) else "🏆 फाइनल रिजल्ट व गलतियाँ देखें"
+        res_text = f"<b>प्रश्न {q_idx + 1}/{len(questions)}:</b> {html.escape(item['q'])}\n\n{verdict}{exp_txt}"
         await query.edit_message_text(
             res_text,
             parse_mode="HTML",
@@ -3182,7 +3033,13 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cb == "qz_next":
         await send_quiz_question(query.message, user_id, context, edit=True)
 
-    # ---------- FEATURE 4: MISTAKE BANK (ADMIN & STUDY) ----------
+    elif cb == "qz_finish_now":
+        st = user_states.get(user_id, {})
+        if st.get("quiz"):
+            st["quiz"]["idx"] = len(st["quiz"]["questions"])
+            await send_quiz_question(query.message, user_id, context, edit=True)
+
+    # ---------- FEATURE 4: MISTAKE BANK ----------
     elif cb in ("s_mis", "adm_mis"):
         is_adm = cb == "adm_mis"
         user_states[user_id] = {"mode": "ADMIN" if is_adm else "STUDY"}
@@ -3233,10 +3090,42 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text(f"<b>{html.escape(mitem['title'])}</b>\n\n{html.escape(mitem.get('text', ''))}", parse_mode="HTML")
 
+    # ---------- FEATURE 5: HTML LIVE MCQ TESTS ----------
+    elif cb in ("s_html_test", "adm_html_test"):
+        is_adm = cb == "adm_html_test"
+        user_states[user_id] = {"mode": "ADMIN" if is_adm else "STUDY"}
+        t_count = len(vault_data.get("tests", {}))
+        title = (
+            f"🛠️ <b>Manage HTML Tests ({t_count})</b>\nअपलोड किए गए टेस्ट या नया <code>.html</code> टेस्ट अपलोड करें:"
+            if is_adm
+            else f"📝 <b>HTML Live MCQ Tests ({t_count})</b>\nलाइव टेस्ट शुरू करने के लिए किसी भी टेस्ट पर क्लिक करें:"
+        )
+        await query.edit_message_text(title, parse_mode="HTML", reply_markup=html_tests_kb(is_adm))
+
+    elif cb == "ht_upload":
+        user_states[user_id] = {"mode": "ADMIN", "step": "HT_WAIT_FILE"}
+        await query.edit_message_text(
+            "📤 अपनी <b>HTML टेस्ट फाइल (.html)</b> यहाँ भेजें—बॉट उसमें से सारे MCQs निकालकर लाइव टेस्ट तैयार कर देगा!",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm_html_test")]]),
+        )
+
+    elif parts[0] == "ht_ren":
+        user_states[user_id] = {"mode": "ADMIN", "step": "HT_REN", "tid": parts[1]}
+        await query.edit_message_text("✏️ इस टेस्ट का नया नाम लिखकर भेजें:")
+
+    elif parts[0] == "ht_del":
+        vault_data.get("tests", {}).pop(parts[1], None)
+        await save_and_pin_backup(context.bot)
+        await query.edit_message_text("🗑️ HTML टेस्ट डिलीट हो गया।", reply_markup=html_tests_kb(True))
+
+    elif parts[0] == "ht_run":
+        await prompt_for_duration(query.message, user_id, {"action": "RUN_HTML_TEST", "tid": parts[1]}, edit=True)
+
 
 # ================= TEXT & MEDIA HANDLERS =================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_logged_in
+    global login_expiry_ts
     user_id = update.effective_user.id
     if user_id != OWNER_ID:
         return  # बाहरी यूज़र के लिए पूरी तरह Silent
@@ -3245,16 +3134,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = user_states.get(user_id, {})
     step = st.get("step")
 
-    if not is_logged_in:
+    if not is_authorized(user_id):
         if step == "AUTH_WAIT_PASS" and text == BOT_PASSWORD:
-            is_logged_in = True
+            login_expiry_ts = time.time() + LOGIN_VALIDITY_SECONDS
             user_states.pop(user_id, None)
             try:
                 await update.message.delete()
             except Exception:
                 pass
             await update.message.reply_text(
-                "✅ <b>Sanskari Study में लॉगिन सफल!</b>\nअपना मोड चुनें:",
+                "✅ <b>Sanskari Study में लॉगिन सफल!</b>\n🔓 यह सेशन अगले <b>24 घंटे</b> तक सक्रिय रहेगा। अपना मोड चुनें:",
                 parse_mode="HTML",
                 reply_markup=root_mode_kb(),
             )
@@ -3271,7 +3160,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user_id] = {"mode": "STUDY", "q_text": text, "q_img": None}
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("💡 Hint (1-2 लाइन क्लू)", callback_data="d_hint")],
-            [InlineKeyboardButton("📝 Step-by-Step Board Solution (कॉपी पेज फोटो)", callback_data="d_sol")],
+            [InlineKeyboardButton("📝 Step-by-Step Board Solution", callback_data="d_sol")],
             [InlineKeyboardButton("⬅️ Study Menu", callback_data="mode_study")],
         ])
         await update.message.reply_text("✅ प्रश्न मिल गया! अब चुनें:", reply_markup=kb)
@@ -3362,6 +3251,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✏️ अपडेट हो गया!", reply_markup=admin_mistake_items_kb(subj, idx))
         return
 
+    if step == "HT_REN":
+        tid = st["tid"]
+        if tid in vault_data.get("tests", {}):
+            vault_data["tests"][tid]["name"] = text
+            await save_and_pin_backup(context.bot)
+        user_states[user_id] = {"mode": "ADMIN"}
+        await update.message.reply_text("✏️ टेस्ट का नाम अपडेट हो गया!", reply_markup=html_tests_kb(True))
+        return
+
     await update.message.reply_text("🏠 अपना मोड चुनें:", reply_markup=root_mode_kb())
 
 
@@ -3374,6 +3272,34 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = user_states.get(user_id, {})
     step = st.get("step")
 
+    # Feature 5: HTML Test File Upload
+    if step == "HT_WAIT_FILE" and msg.document:
+        fname = msg.document.file_name or "Live_Test.html"
+        if not fname.lower().endswith((".html", ".htm")):
+            await msg.reply_text("⚠️ कृपया केवल <code>.html</code> या <code>.htm</code> टेस्ट फाइल भेजें।", parse_mode="HTML")
+            return
+        doc_file = await msg.document.get_file()
+        bio = io.BytesIO()
+        await doc_file.download_to_memory(bio)
+        parsed_qs = parse_html_mcq_file(bio.getvalue())
+        if not parsed_qs:
+            await msg.reply_text(
+                "⚠️ इस HTML फाइल से प्रश्न नहीं निकल पाए। सुनिश्चित करें कि फाइल में प्रश्न, 4 विकल्प (A, B, C, D) और उत्तर मौजूद हैं।",
+                reply_markup=html_tests_kb(True),
+            )
+            return
+        tid = next_id("ht")
+        clean_name = re.sub(r"\.(html|htm)$", "", fname, flags=re.I)
+        vault_data.setdefault("tests", {})[tid] = {"name": clean_name, "questions": parsed_qs}
+        user_states[user_id] = {"mode": "ADMIN"}
+        await save_and_pin_backup(context.bot)
+        await msg.reply_text(
+            f"✅ <b>HTML लाइव टेस्ट तैयार हो गया!</b>\n📘 <b>नाम:</b> {html.escape(clean_name)}\n🎯 <b>कुल प्रश्न:</b> {len(parsed_qs)} MCQs\n\nअब आप <b>Study / Viewer Mode → HTML Live MCQ Test</b> में जाकर लाइव टेस्ट दे सकते हैं!",
+            parse_mode="HTML",
+            reply_markup=html_tests_kb(True),
+        )
+        return
+
     if step == "DOUBT_WAIT_Q" and msg.photo:
         pfile = await msg.photo[-1].get_file()
         bio = io.BytesIO()
@@ -3385,7 +3311,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("💡 Hint (1-2 लाइन क्लू)", callback_data="d_hint")],
-            [InlineKeyboardButton("📝 Step-by-Step Board Solution (कॉपी पेज फोटो)", callback_data="d_sol")],
+            [InlineKeyboardButton("📝 Step-by-Step Board Solution", callback_data="d_sol")],
             [InlineKeyboardButton("⬅️ Study Menu", callback_data="mode_study")],
         ])
         await msg.reply_text("✅ प्रश्न की फोटो मिल गई! अब चुनें:", reply_markup=kb)
@@ -3429,7 +3355,10 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"✅ सेव हो गया: <b>{html.escape(default_name)}</b>", parse_mode="HTML")
         return
 
-    await msg.reply_text("ℹ️ फाइल अपलोड करने के लिए <b>Admin Mode → Manage Study Vault</b> में जाकर किसी फोल्डर के अंदर <b>📤 यहाँ फाइल अपलोड करें</b> दबाएं।", parse_mode="HTML")
+    await msg.reply_text(
+        "ℹ️ फाइल अपलोड करने के लिए <b>Admin Mode</b> में जाकर संबंधित फोल्डर या <b>Manage HTML Tests</b> खोलें।",
+        parse_mode="HTML",
+    )
 
 
 # ================= RENDER HEALTH SERVER =================
@@ -3454,35 +3383,9 @@ def start_health_server():
 
 
 def main():
-    ensure_fonts()
-    threading.Thread(target=start_health_server, daemon=True).start()
-
-    app = Application.builder().token(BOT_TOKEN).post_init(restore_from_pinned_backup).build()
-
-    app.add_handler(CommandHandler("suraj", cmd_suraj))
-    app.add_handler(CommandHandler("logout", cmd_logout))
-    app.add_handler(CallbackQueryHandler(handle_callbacks))
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL | filters.VIDEO | filters.PHOTO | filters.AUDIO | filters.VOICE,
-            handle_media,
-        )
-    )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    print("Sanskari Study Bot (100% Offline Revision + 4-in-1 Vault) running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
-def main():
-    import asyncio
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    ensure_fonts()
     threading.Thread(target=start_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).post_init(restore_from_pinned_backup).build()
@@ -3498,7 +3401,7 @@ def main():
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("Sanskari Study Bot (100% Offline Revision + 4-in-1 Vault) running...")
+    print("Sanskari Study Bot (Fast Text + 24h Login + HTML Live Test) running...")
     app.run_polling()
 
 
