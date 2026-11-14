@@ -609,13 +609,11 @@ async def cmd_suraj(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rem_hrs = round((login_expiry_ts - time.time()) / 3600, 1)
         user_states.pop(user_id, None)
         await update.message.reply_text(
-            f"👋 स्वागत है सूरज!
-✨ आपका 24h सेशन एक्टिव है (शेष ~{rem_hrs} घंटे)।
-
-<b>Sanskari Study</b> का मोड चुनें:",
+                    await update.message.reply_text(
+            f"👋 स्वागत है सूरज!\n✨ आपका 24h सेशन एक्टिव है (शेष ~{rem_hrs} घंटे)।\n\n<b>Sanskari Study</b> का मोड चुनें:",
             parse_mode="HTML",
             reply_markup=root_mode_kb(),
-        )
+                    )
         return
 
     user_states[user_id] = {"step": "AUTH_WAIT_PASS"}
