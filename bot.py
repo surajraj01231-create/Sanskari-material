@@ -614,9 +614,7 @@ async def cmd_suraj(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=root_mode_kb(),
                     )
-        return
-
-    user_states[user_id] = {"step": "AUTH_WAIT_PASS"}
+user_states[user_id] = {"step": "AUTH_WAIT_PASS"}
     await update.message.reply_text("🔐 पासवर्ड डालें (एक बार डालने पर 24 घंटे वैध रहेगा):")
 
 
